@@ -11,6 +11,35 @@ Before testing, ensure you have:
 3. Required SSM parameters and secrets configured
 4. DynamoDB table `aurora-restore-audit` created
 5. SNS topic `aurora-restore-notifications` created
+6. Target VPC, subnet, and security group information available
+
+## Required Network Configuration
+
+For the Aurora restore process, you need to have the following network configuration information available:
+
+1. **Target VPC ID**: The VPC where the restored Aurora cluster will be deployed
+2. **Target Subnet IDs**: The subnets where the Aurora cluster will be placed (typically at least two subnets in different Availability Zones)
+3. **Target Security Group IDs**: The security groups that will be applied to the restored Aurora cluster
+
+These parameters should be configured in SSM Parameter Store:
+
+```bash
+# Target VPC and subnet parameters
+aws ssm put-parameter \
+    --name "/aurora-restore/target-vpc-id" \
+    --value "vpc-12345678" \
+    --type String
+
+aws ssm put-parameter \
+    --name "/aurora-restore/target-subnet-ids" \
+    --value "subnet-12345678,subnet-87654321" \
+    --type String
+
+aws ssm put-parameter \
+    --name "/aurora-restore/target-security-group-ids" \
+    --value "sg-12345678" \
+    --type String
+```
 
 ## General Testing Steps
 
@@ -191,6 +220,8 @@ For each Lambda function, follow these general steps:
 }
 ```
 
+**Note:** The `aurora-restore-restore-snapshot` function will automatically retrieve the VPC, subnet, and security group information from SSM Parameter Store. Make sure these parameters are properly configured before testing this function.
+
 ### 6. Testing `aurora-restore-check-restore-status`
 
 **Steps:**
@@ -367,13 +398,19 @@ If you encounter issues during console testing:
 
 2. **Verify IAM Permissions**: Ensure the Lambda execution role has the necessary permissions for all AWS services it interacts with.
 
-3. **Check SSM Parameters**: Verify that all required SSM parameters are correctly configured.
+3. **Check SSM Parameters**: Verify that all required SSM parameters are correctly configured, especially the VPC, subnet, and security group parameters.
 
 4. **Validate Secrets**: Ensure the Secrets Manager secret containing database credentials is properly set up.
 
 5. **Network Connectivity**: For cross-account operations, verify that the necessary network connectivity and permissions are in place.
 
 6. **KMS Key Sharing**: For snapshot copying between accounts, ensure KMS keys are properly shared.
+
+7. **VPC Configuration**: Ensure the target VPC has the necessary configuration for Aurora, including:
+   - Proper DNS settings
+   - Sufficient IP address space
+   - Appropriate route tables
+   - Network ACLs that allow Aurora traffic
 
 ## Testing in a Development Environment
 

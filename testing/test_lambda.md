@@ -142,21 +142,10 @@ def test_restore_snapshot():
         'valid_restore': {
             'snapshot_id': 'valid-snapshot-id',
             'cluster_id': 'new-cluster-id',
-            'region': 'us-west-2',
-            'vpc_id': 'vpc-12345678',
-            'subnet_ids': ['subnet-12345678', 'subnet-87654321'],
-            'security_group_ids': ['sg-12345678']
+            'region': 'us-west-2'
         },
         'invalid_snapshot': {
             'snapshot_id': 'invalid-snapshot-id',
-            'cluster_id': 'new-cluster-id',
-            'region': 'us-west-2',
-            'vpc_id': 'vpc-12345678',
-            'subnet_ids': ['subnet-12345678', 'subnet-87654321'],
-            'security_group_ids': ['sg-12345678']
-        },
-        'missing_network_config': {
-            'snapshot_id': 'valid-snapshot-id',
             'cluster_id': 'new-cluster-id',
             'region': 'us-west-2'
         }
