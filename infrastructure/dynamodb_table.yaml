@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB table for Aurora Restore Pipeline state management'
+
+Resources:
+  AuroraRestoreStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-aurora-restore-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: operation_id
+          AttributeType: S
+        - AttributeName: step
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: operation_id
+          KeyType: HASH
+        - AttributeName: step
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: AuroraRestore
+        - Key: Environment
+          Value: !Ref Environment
+
+  AuroraRestoreStateTableIndex:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-aurora-restore-state-index
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: operation_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: operation_id
+          KeyType: HASH
+        - AttributeName: status
+          KeyType: RANGE
+      Tags:
+        - Key: Application
+          Value: AuroraRestore
+        - Key: Environment
+          Value: !Ref Environment
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment for the Aurora Restore Pipeline
+
+Outputs:
+  StateTableName:
+    Description: Name of the DynamoDB table for state management
+    Value: !Ref AuroraRestoreStateTable
+    Export:
+      Name: !Sub ${AWS::StackName}-StateTableName
+  
+  StateTableArn:
+    Description: ARN of the DynamoDB table for state management
+    Value: !GetAtt AuroraRestoreStateTable.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-StateTableArn 

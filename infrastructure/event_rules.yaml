@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EventBridge Rules for Aurora Restore Pipeline'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment for the Aurora Restore Pipeline
+
+  StateMachineArn:
+    Type: String
+    Description: ARN of the Aurora Restore State Machine
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(5 0 * * ? *)
+    Description: Schedule expression for daily restore (UTC)
+
+Resources:
+  # EventBridge Role
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AuroraRestoreEventBridgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref StateMachineArn
+
+  # Daily Restore Rule
+  DailyRestoreRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-daily-restore
+      Description: Triggers daily Aurora restore process
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachineArn
+          Id: DailyRestoreTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: !Sub |
+            {
+              "operation_id": "daily-restore-${AWS::StackName}",
+              "date": "{{date}}"
+            }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AuroraRestore
+
+  # Manual Restore Rule
+  ManualRestoreRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-manual-restore
+      Description: Triggers manual Aurora restore process
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          service:
+            - RDS
+          eventTypeCategory:
+            - issue
+          eventTypeCode:
+            - AWS_RDS_OPERATIONAL_NOTIFICATION
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachineArn
+          Id: ManualRestoreTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: !Sub |
+            {
+              "operation_id": "manual-restore-${AWS::StackName}",
+              "date": "{{date}}",
+              "trigger": "health-event"
+            }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AuroraRestore
+
+Outputs:
+  DailyRestoreRuleArn:
+    Description: ARN of the Daily Restore Rule
+    Value: !GetAtt DailyRestoreRule.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DailyRestoreRuleArn
+
+  ManualRestoreRuleArn:
+    Description: ARN of the Manual Restore Rule
+    Value: !GetAtt ManualRestoreRule.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ManualRestoreRuleArn 

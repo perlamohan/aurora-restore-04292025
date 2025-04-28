@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda functions for Aurora Restore Pipeline'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment for the Aurora Restore Pipeline
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for Lambda functions
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for Lambda functions
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security Group IDs for Lambda functions
+
+  StateTableName:
+    Type: String
+    Description: Name of the DynamoDB state table
+
+  AuditTableName:
+    Type: String
+    Description: Name of the DynamoDB audit table
+
+  NotificationTopicArn:
+    Type: String
+    Description: ARN of the SNS topic for notifications
+
+Resources:
+  # Common Lambda Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AuroraRestoreLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBSnapshots
+                  - rds:CopyDBSnapshot
+                  - rds:DeleteDBCluster
+                  - rds:RestoreDBClusterFromSnapshot
+                  - rds:DescribeDBClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopicArn
+
+  # Lambda Functions
+  SnapshotCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-snapshot-check
+      Handler: snapshot_check.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  CopySnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-copy-snapshot
+      Handler: copy_snapshot.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  CheckCopyStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-check-copy-status
+      Handler: check_copy_status.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  DeleteRDSFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-delete-rds
+      Handler: delete_rds.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  RestoreSnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-restore-snapshot
+      Handler: restore_snapshot.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  CheckRestoreStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-check-restore-status
+      Handler: check_restore_status.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  SetupDBUsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-setup-db-users
+      Handler: setup_db_users.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  ArchiveSnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-archive-snapshot
+      Handler: archive_snapshot.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+  SNSNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-sns-notification
+      Handler: sns_notification.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTableName
+          AUDIT_TABLE: !Ref AuditTableName
+          ENVIRONMENT: !Ref Environment
+          NOTIFICATION_TOPIC: !Ref NotificationTopicArn
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        Environment: !Ref Environment
+        Purpose: AuroraRestore
+
+Outputs:
+  SnapshotCheckFunctionArn:
+    Description: ARN of the Snapshot Check Lambda function
+    Value: !GetAtt SnapshotCheckFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SnapshotCheckFunctionArn
+
+  CopySnapshotFunctionArn:
+    Description: ARN of the Copy Snapshot Lambda function
+    Value: !GetAtt CopySnapshotFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CopySnapshotFunctionArn
+
+  CheckCopyStatusFunctionArn:
+    Description: ARN of the Check Copy Status Lambda function
+    Value: !GetAtt CheckCopyStatusFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CheckCopyStatusFunctionArn
+
+  DeleteRDSFunctionArn:
+    Description: ARN of the Delete RDS Lambda function
+    Value: !GetAtt DeleteRDSFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DeleteRDSFunctionArn
+
+  RestoreSnapshotFunctionArn:
+    Description: ARN of the Restore Snapshot Lambda function
+    Value: !GetAtt RestoreSnapshotFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-RestoreSnapshotFunctionArn
+
+  CheckRestoreStatusFunctionArn:
+    Description: ARN of the Check Restore Status Lambda function
+    Value: !GetAtt CheckRestoreStatusFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CheckRestoreStatusFunctionArn
+
+  SetupDBUsersFunctionArn:
+    Description: ARN of the Setup DB Users Lambda function
+    Value: !GetAtt SetupDBUsersFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SetupDBUsersFunctionArn
+
+  ArchiveSnapshotFunctionArn:
+    Description: ARN of the Archive Snapshot Lambda function
+    Value: !GetAtt ArchiveSnapshotFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ArchiveSnapshotFunctionArn
+
+  SNSNotificationFunctionArn:
+    Description: ARN of the SNS Notification Lambda function
+    Value: !GetAtt SNSNotificationFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SNSNotificationFunctionArn 

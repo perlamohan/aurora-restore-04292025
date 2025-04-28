@@ -1,0 +1,35 @@
+{
+    "source_region": "us-east-1",
+    "target_region": "us-west-2",
+    "source_cluster_id": "your-source-cluster",
+    "target_cluster_id": "your-target-cluster",
+    "snapshot_prefix": "aurora-snapshot",
+    "vpc_config": {
+        "vpc_id": "vpc-xxxxxxxx",
+        "subnet_ids": [
+            "subnet-xxxxxxxx",
+            "subnet-yyyyyyyy"
+        ],
+        "security_group_ids": [
+            "sg-xxxxxxxx"
+        ]
+    },
+    "restore_params": {
+        "db_subnet_group_name": "your-db-subnet-group",
+        "vpc_security_group_ids": [
+            "sg-xxxxxxxx"
+        ],
+        "environment": "dev",
+        "deletion_protection": false,
+        "port": 5432,
+        "availability_zones": [
+            "us-west-2a",
+            "us-west-2b"
+        ],
+        "enable_iam_database_authentication": true,
+        "storage_encrypted": true
+    },
+    "master_credentials_secret_id": "aurora-restore-master-credentials",
+    "app_credentials_secret_id": "aurora-restore-app-credentials",
+    "sns_topic_arn": "arn:aws:sns:region:account:aurora-restore-notifications"
+} 
