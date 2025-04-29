@@ -41,10 +41,10 @@ class NotifyCompletionHandler(BaseHandler):
             raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
         if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {this.config['target_region']}")
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
         
-        if not validate_cluster_id(this.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {this.config['target_cluster_id']}")
+        if not validate_cluster_id(self.config['target_cluster_id']):
+            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
     
     def initialize_clients(self) -> None:
         """
@@ -53,11 +53,11 @@ class NotifyCompletionHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not this.config.get('target_region'):
+        if not self.config.get('target_region'):
             raise ValueError("Target region is required")
         
-        this.sns_client = get_client('sns', this.config['target_region'])
-        this.sqs_client = get_client('sqs', this.config['target_region'])
+        self.sns_client = get_client('sns', self.config['target_region'])
+        self.sqs_client = get_client('sqs', self.config['target_region'])
     
     def get_operation_summary(self, operation_id: str) -> Dict[str, Any]:
         """
@@ -117,7 +117,7 @@ class NotifyCompletionHandler(BaseHandler):
             Exception: If notification fails
         """
         try:
-            topic_arn = this.config['notification_topic_arn']
+            topic_arn = self.config['notification_topic_arn']
             
             # Prepare message
             message = {
@@ -128,7 +128,7 @@ class NotifyCompletionHandler(BaseHandler):
             }
             
             # Send message
-            response = this.sns_client.publish(
+            response = self.sns_client.publish(
                 TopicArn=topic_arn,
                 Message=json.dumps(message),
                 Subject=f"Aurora Restore Completion - {summary['target_cluster_id']}"
@@ -157,7 +157,7 @@ class NotifyCompletionHandler(BaseHandler):
             Exception: If message sending fails
         """
         try:
-            queue_url = this.config['notification_queue_url']
+            queue_url = self.config['notification_queue_url']
             
             # Prepare message
             message = {
@@ -168,7 +168,7 @@ class NotifyCompletionHandler(BaseHandler):
             }
             
             # Send message
-            response = this.sqs_client.send_message(
+            response = self.sqs_client.send_message(
                 QueueUrl=queue_url,
                 MessageBody=json.dumps(message)
             )
@@ -194,20 +194,20 @@ class NotifyCompletionHandler(BaseHandler):
         """
         try:
             # Get operation ID
-            operation_id = this.get_operation_id(event)
+            operation_id = self.get_operation_id(event)
             
             # Validate configuration
-            this.validate_config()
+            self.validate_config()
             
             # Initialize clients
-            this.initialize_clients()
+            self.initialize_clients()
             
             # Get operation summary
-            summary = this.get_operation_summary(operation_id)
+            summary = self.get_operation_summary(operation_id)
             
             # Send notifications
-            sns_message_id = this.send_sns_notification(operation_id, summary)
-            sqs_message_id = this.send_sqs_message(operation_id, summary)
+            sns_message_id = self.send_sns_notification(operation_id, summary)
+            sqs_message_id = self.send_sqs_message(operation_id, summary)
             
             # Update state with notification information
             notification_data = {
@@ -220,7 +220,7 @@ class NotifyCompletionHandler(BaseHandler):
             update_state(operation_id, notification_data)
             
             # Log audit
-            this.log_audit(operation_id, 'SUCCESS', {
+            self.log_audit(operation_id, 'SUCCESS', {
                 'target_cluster_id': summary['target_cluster_id'],
                 'status': summary['status'],
                 'sns_message_id': sns_message_id,
@@ -228,9 +228,9 @@ class NotifyCompletionHandler(BaseHandler):
             })
             
             # Update metrics
-            this.update_metrics(operation_id, 'notification_sent', 1)
+            self.update_metrics(operation_id, 'notification_sent', 1)
             
-            return this.create_response(operation_id, {
+            return self.create_response(operation_id, {
                 'message': f"Successfully sent completion notifications for cluster {summary['target_cluster_id']}",
                 'target_cluster_id': summary['target_cluster_id'],
                 'status': summary['status'],
@@ -239,8 +239,8 @@ class NotifyCompletionHandler(BaseHandler):
                 'next_step': None
             })
         except Exception as e:
-            return this.handle_error(operation_id, e, {
-                'target_cluster_id': this.config.get('target_cluster_id')
+            return self.handle_error(operation_id, e, {
+                'target_cluster_id': self.config.get('target_cluster_id')
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

@@ -43,10 +43,10 @@ class CleanupHandler(BaseHandler):
             raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
         if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {this.config['target_region']}")
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
         
-        if not validate_cluster_id(this.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {this.config['target_cluster_id']}")
+        if not validate_cluster_id(self.config['target_cluster_id']):
+            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
     
     def initialize_clients(self) -> None:
         """
@@ -55,12 +55,12 @@ class CleanupHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not this.config.get('target_region'):
+        if not self.config.get('target_region'):
             raise ValueError("Target region is required")
         
-        this.rds_client = get_client('rds', this.config['target_region'])
-        this.s3_client = get_client('s3', this.config['target_region'])
-        this.dynamodb_client = get_client('dynamodb', this.config['target_region'])
+        self.rds_client = get_client('rds', self.config['target_region'])
+        self.s3_client = get_client('s3', self.config['target_region'])
+        self.dynamodb_client = get_client('dynamodb', self.config['target_region'])
     
     def get_operation_details(self, operation_id: str) -> Dict[str, Any]:
         """
@@ -108,7 +108,7 @@ class CleanupHandler(BaseHandler):
             logger.info(f"Deleting snapshot {snapshot_id}")
             
             # Delete the snapshot
-            this.rds_client.delete_db_cluster_snapshot(
+            self.rds_client.delete_db_cluster_snapshot(
                 DBClusterSnapshotIdentifier=snapshot_id
             )
             
@@ -168,8 +168,8 @@ class CleanupHandler(BaseHandler):
             logger.info(f"Deleting logs for operation {operation_id}")
             
             # Get the log bucket and prefix from config
-            log_bucket = this.config.get('log_bucket')
-            log_prefix = this.config.get('log_prefix', 'aurora-restore-logs')
+            log_bucket = self.config.get('log_bucket')
+            log_prefix = self.config.get('log_prefix', 'aurora-restore-logs')
             
             if not log_bucket:
                 logger.warning("No log bucket configured, skipping log deletion")
@@ -178,7 +178,7 @@ class CleanupHandler(BaseHandler):
             # List objects with the operation ID prefix
             prefix = f"{log_prefix}/{operation_id}/"
             
-            response = this.s3_client.list_objects_v2(
+            response = self.s3_client.list_objects_v2(
                 Bucket=log_bucket,
                 Prefix=prefix
             )
@@ -186,7 +186,7 @@ class CleanupHandler(BaseHandler):
             # Delete objects
             if 'Contents' in response:
                 for obj in response['Contents']:
-                    this.s3_client.delete_object(
+                    self.s3_client.delete_object(
                         Bucket=log_bucket,
                         Key=obj['Key']
                     )
@@ -213,16 +213,16 @@ class CleanupHandler(BaseHandler):
         """
         try:
             # Get operation ID
-            operation_id = this.get_operation_id(event)
+            operation_id = self.get_operation_id(event)
             
             # Validate configuration
-            this.validate_config()
+            self.validate_config()
             
             # Initialize clients
-            this.initialize_clients()
+            self.initialize_clients()
             
             # Get operation details
-            operation_details = this.get_operation_details(operation_id)
+            operation_details = self.get_operation_details(operation_id)
             
             # Initialize cleanup results
             cleanup_results = {
@@ -232,37 +232,37 @@ class CleanupHandler(BaseHandler):
             }
             
             # Delete snapshot if configured
-            if this.config.get('cleanup_snapshot', True):
+            if self.config.get('cleanup_snapshot', True):
                 snapshot_id = operation_details.get('snapshot_id')
                 if snapshot_id:
-                    cleanup_results['snapshot_deleted'] = this.delete_snapshot(snapshot_id)
+                    cleanup_results['snapshot_deleted'] = self.delete_snapshot(snapshot_id)
             
             # Delete state data if configured
-            if this.config.get('cleanup_state_data', True):
-                cleanup_results['state_data_deleted'] = this.delete_state_data(operation_id)
+            if self.config.get('cleanup_state_data', True):
+                cleanup_results['state_data_deleted'] = self.delete_state_data(operation_id)
             
             # Delete logs if configured
-            if this.config.get('cleanup_logs', True):
-                cleanup_results['logs_deleted'] = this.delete_logs(operation_id)
+            if self.config.get('cleanup_logs', True):
+                cleanup_results['logs_deleted'] = self.delete_logs(operation_id)
             
             # Log audit
-            this.log_audit(operation_id, 'SUCCESS', {
+            self.log_audit(operation_id, 'SUCCESS', {
                 'target_cluster_id': operation_details.get('target_cluster_id'),
                 'cleanup_results': cleanup_results
             })
             
             # Update metrics
-            this.update_metrics(operation_id, 'cleanup_completed', 1)
+            self.update_metrics(operation_id, 'cleanup_completed', 1)
             
-            return this.create_response(operation_id, {
+            return self.create_response(operation_id, {
                 'message': f"Successfully completed cleanup for operation {operation_id}",
                 'target_cluster_id': operation_details.get('target_cluster_id'),
                 'cleanup_results': cleanup_results,
                 'next_step': None
             })
         except Exception as e:
-            return this.handle_error(operation_id, e, {
-                'target_cluster_id': this.config.get('target_cluster_id')
+            return self.handle_error(operation_id, e, {
+                'target_cluster_id': self.config.get('target_cluster_id')
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

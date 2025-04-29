@@ -40,10 +40,10 @@ class VerifyRestoreHandler(BaseHandler):
             raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
         if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {this.config['target_region']}")
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
         
-        if not validate_cluster_id(this.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {this.config['target_cluster_id']}")
+        if not validate_cluster_id(self.config['target_cluster_id']):
+            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
     
     def initialize_clients(self) -> None:
         """
@@ -52,11 +52,11 @@ class VerifyRestoreHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not this.config.get('target_region'):
+        if not self.config.get('target_region'):
             raise ValueError("Target region is required")
         
-        this.rds_client = get_client('rds', this.config['target_region'])
-        this.secrets_client = get_client('secretsmanager', this.config['target_region'])
+        self.rds_client = get_client('rds', self.config['target_region'])
+        self.secrets_client = get_client('secretsmanager', self.config['target_region'])
     
     def get_cluster_endpoint(self, cluster_id: str) -> Tuple[str, int]:
         """
@@ -72,7 +72,7 @@ class VerifyRestoreHandler(BaseHandler):
             Exception: If endpoint retrieval fails
         """
         try:
-            response = this.rds_client.describe_db_clusters(
+            response = self.rds_client.describe_db_clusters(
                 DBClusterIdentifier=cluster_id
             )
             
@@ -99,8 +99,8 @@ class VerifyRestoreHandler(BaseHandler):
             Exception: If credentials retrieval fails
         """
         try:
-            secret_id = this.config['master_credentials_secret_id']
-            secret = get_secret(this.secrets_client, secret_id)
+            secret_id = self.config['master_credentials_secret_id']
+            secret = get_secret(self.secrets_client, secret_id)
             
             if not secret:
                 raise ValueError(f"Secret {secret_id} not found")
@@ -235,25 +235,25 @@ class VerifyRestoreHandler(BaseHandler):
         """
         try:
             # Get operation ID
-            operation_id = this.get_operation_id(event)
+            operation_id = self.get_operation_id(event)
             
             # Validate configuration
-            this.validate_config()
+            self.validate_config()
             
             # Initialize clients
-            this.initialize_clients()
+            self.initialize_clients()
             
             # Get cluster details
-            cluster_id = this.config['target_cluster_id']
+            cluster_id = self.config['target_cluster_id']
             
             # Get cluster endpoint
-            endpoint, port = this.get_cluster_endpoint(cluster_id)
+            endpoint, port = self.get_cluster_endpoint(cluster_id)
             
             # Get master credentials
-            master_username, master_password = this.get_master_credentials()
+            master_username, master_password = self.get_master_credentials()
             
             # Verify connection
-            connection_verified = this.verify_connection(endpoint, port, master_username, master_password)
+            connection_verified = self.verify_connection(endpoint, port, master_username, master_password)
             
             if not connection_verified:
                 error_message = f"Failed to verify connection to cluster {cluster_id}"
@@ -270,25 +270,25 @@ class VerifyRestoreHandler(BaseHandler):
                     'error': error_message
                 }
                 
-                this.save_state(state_data)
+                self.save_state(state_data)
                 
                 # Log audit with failure
-                this.log_audit(operation_id, 'FAILED', {
+                self.log_audit(operation_id, 'FAILED', {
                     'target_cluster_id': cluster_id,
                     'error': error_message
                 })
                 
                 # Update metrics with failure
-                this.update_metrics(operation_id, 'verification_failure', 1)
+                self.update_metrics(operation_id, 'verification_failure', 1)
                 
-                return this.create_response(operation_id, {
+                return self.create_response(operation_id, {
                     'message': error_message,
                     'target_cluster_id': cluster_id,
                     'next_step': None
                 }, 500)
             
             # Verify schema
-            schema_info = this.verify_schema(endpoint, port, master_username, master_password)
+            schema_info = self.verify_schema(endpoint, port, master_username, master_password)
             
             # Save state
             state_data = {
@@ -301,24 +301,24 @@ class VerifyRestoreHandler(BaseHandler):
                 'success': True
             }
             
-            this.save_state(state_data)
+            self.save_state(state_data)
             
             # Log audit
-            this.log_audit(operation_id, 'SUCCESS', {
+            self.log_audit(operation_id, 'SUCCESS', {
                 'target_cluster_id': cluster_id,
                 'schema_count': len(schema_info['schemas']),
                 'table_count': len(schema_info['tables'])
             })
             
             # Update metrics
-            this.update_metrics(operation_id, 'verification_success', 1)
-            this.update_metrics(operation_id, 'schema_count', len(schema_info['schemas']))
-            this.update_metrics(operation_id, 'table_count', len(schema_info['tables']))
+            self.update_metrics(operation_id, 'verification_success', 1)
+            self.update_metrics(operation_id, 'schema_count', len(schema_info['schemas']))
+            self.update_metrics(operation_id, 'table_count', len(schema_info['tables']))
             
             # Trigger next step
             trigger_next_step(operation_id, 'notify_completion', state_data)
             
-            return this.create_response(operation_id, {
+            return self.create_response(operation_id, {
                 'message': f"Successfully verified cluster {cluster_id}",
                 'target_cluster_id': cluster_id,
                 'cluster_endpoint': endpoint,
@@ -327,8 +327,8 @@ class VerifyRestoreHandler(BaseHandler):
                 'next_step': 'notify_completion'
             })
         except Exception as e:
-            return this.handle_error(operation_id, e, {
-                'target_cluster_id': this.config.get('target_cluster_id')
+            return self.handle_error(operation_id, e, {
+                'target_cluster_id': self.config.get('target_cluster_id')
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

@@ -96,7 +96,7 @@ class RestoreSnapshotHandler(BaseHandler):
             Exception: If snapshot check fails
         """
         try:
-            response = this.rds_client.describe_db_cluster_snapshots(
+            response = self.rds_client.describe_db_cluster_snapshots(
                 DBClusterSnapshotIdentifier=snapshot_arn
             )
             
@@ -122,7 +122,7 @@ class RestoreSnapshotHandler(BaseHandler):
             Exception: If check fails
         """
         try:
-            response = this.rds_client.describe_db_clusters(
+            response = self.rds_client.describe_db_clusters(
                 DBClusterIdentifier=cluster_id
             )
             
@@ -175,7 +175,7 @@ class RestoreSnapshotHandler(BaseHandler):
                 restore_params['DBClusterParameterGroupName'] = self.config['target_parameter_group']
             
             # Restore the cluster
-            response = this.rds_client.restore_db_cluster_from_snapshot(**restore_params)
+            response = self.rds_client.restore_db_cluster_from_snapshot(**restore_params)
             
             return response['DBCluster']
         except Exception as e:
@@ -195,26 +195,26 @@ class RestoreSnapshotHandler(BaseHandler):
         """
         try:
             # Get operation ID
-            operation_id = this.get_operation_id(event)
+            operation_id = self.get_operation_id(event)
             
             # Validate configuration
-            this.validate_config()
+            self.validate_config()
             
             # Validate snapshot parameters
-            this.validate_snapshot_params(event)
+            self.validate_snapshot_params(event)
             
             # Initialize RDS client
-            this.initialize_rds_client()
+            self.initialize_rds_client()
             
             # Get snapshot and cluster details
             snapshot_arn = event['target_snapshot_arn']
-            cluster_id = this.config['target_cluster_id']
+            cluster_id = self.config['target_cluster_id']
             
             # Check if snapshot exists
-            snapshot_details = this.check_snapshot_exists(snapshot_arn)
+            snapshot_details = self.check_snapshot_exists(snapshot_arn)
             
             # Check if cluster already exists
-            cluster_exists = this.check_cluster_exists(cluster_id)
+            cluster_exists = self.check_cluster_exists(cluster_id)
             
             if cluster_exists:
                 # Cluster already exists, cannot restore
@@ -233,19 +233,19 @@ class RestoreSnapshotHandler(BaseHandler):
                     'error': error_message
                 }
                 
-                this.save_state(state_data)
+                self.save_state(state_data)
                 
                 # Log audit with failure
-                this.log_audit(operation_id, 'FAILED', {
+                self.log_audit(operation_id, 'FAILED', {
                     'target_cluster_id': cluster_id,
                     'target_snapshot_name': event['target_snapshot_name'],
                     'error': error_message
                 })
                 
                 # Update metrics with failure
-                this.update_metrics(operation_id, 'restore_failure', 1)
+                self.update_metrics(operation_id, 'restore_failure', 1)
                 
-                return this.create_response(operation_id, {
+                return self.create_response(operation_id, {
                     'message': error_message,
                     'target_cluster_id': cluster_id,
                     'target_snapshot_name': event['target_snapshot_name'],
@@ -253,7 +253,7 @@ class RestoreSnapshotHandler(BaseHandler):
                 }, 500)
             
             # Restore from snapshot
-            restore_response = this.restore_from_snapshot(snapshot_arn, cluster_id)
+            restore_response = self.restore_from_snapshot(snapshot_arn, cluster_id)
             
             # Save state
             state_data = {
@@ -266,22 +266,22 @@ class RestoreSnapshotHandler(BaseHandler):
                 'success': True
             }
             
-            this.save_state(state_data)
+            self.save_state(state_data)
             
             # Log audit
-            this.log_audit(operation_id, 'SUCCESS', {
+            self.log_audit(operation_id, 'SUCCESS', {
                 'target_cluster_id': cluster_id,
                 'target_snapshot_name': event['target_snapshot_name'],
                 'restore_status': restore_response['Status']
             })
             
             # Update metrics
-            this.update_metrics(operation_id, 'cluster_restored', 1)
+            self.update_metrics(operation_id, 'cluster_restored', 1)
             
             # Trigger next step
             trigger_next_step(operation_id, 'check_restore_status', state_data)
             
-            return this.create_response(operation_id, {
+            return self.create_response(operation_id, {
                 'message': f"Cluster {cluster_id} restore initiated",
                 'target_cluster_id': cluster_id,
                 'target_snapshot_name': event['target_snapshot_name'],
@@ -289,8 +289,8 @@ class RestoreSnapshotHandler(BaseHandler):
                 'next_step': 'check_restore_status'
             })
         except Exception as e:
-            return this.handle_error(operation_id, e, {
-                'target_cluster_id': this.config.get('target_cluster_id'),
+            return self.handle_error(operation_id, e, {
+                'target_cluster_id': self.config.get('target_cluster_id'),
                 'target_snapshot_name': event.get('target_snapshot_name')
             })
 
