@@ -1,510 +1,309 @@
 #!/usr/bin/env python3
 """
-Lambda function to restore a DB cluster from a snapshot.
+Lambda function to restore an Aurora cluster from a snapshot.
 """
 
 import json
 import time
-import boto3
-from typing import Dict, Any
-from botocore.exceptions import ClientError
+from typing import Dict, Any, Optional, Tuple
 
-from utils.common import (
-    logger,
-    get_config,
-    log_audit_event,
-    update_metrics,
-    validate_required_params,
-    validate_region,
-    get_operation_id,
-    save_state,
-    handle_aws_error,
-    trigger_next_step
-)
+from utils.base_handler import BaseHandler
+from utils.common import logger
+from utils.validation import validate_required_params, validate_region, validate_cluster_id, validate_snapshot_name
+from utils.aws_utils import get_client, handle_aws_error
+from utils.state_utils import trigger_next_step
 
-def lambda_handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    """
-    Restore a DB cluster from a snapshot.
+class RestoreSnapshotHandler(BaseHandler):
+    """Handler for restoring Aurora clusters from snapshots."""
     
-    Args:
-        event: Lambda event containing:
-            - operation_id: Optional operation ID for retry scenarios
-            - target_snapshot_name: Name of the snapshot to restore from
-            - target_cluster_id: ID of the cluster to restore to
-            - target_region: AWS region where the snapshot exists and cluster will be created
-        _context: Lambda context
+    def __init__(self):
+        """Initialize the restore snapshot handler."""
+        super().__init__('restore_snapshot')
+        self.rds_client = None
     
-    Returns:
-        dict: Response containing:
-            - statusCode: HTTP status code
-            - body: Response body with operation details
-    """
-    start_time = time.time()
-    operation_id = get_operation_id(event)
-    
-    try:
-        # Get configuration
-        config = get_config()
+    def validate_config(self) -> None:
+        """
+        Validate required configuration parameters.
         
-        # Load previous state
-        state = load_state(operation_id)
-        if not state:
-            error_msg = f"No previous state found for operation {operation_id}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='restore_snapshot',
-                status='failed',
-                details={'error': error_msg}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
-            
-        if not state.get('success', False):
-            error_msg = f"Previous step failed for operation {operation_id}"
-            logger.warning(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='restore_snapshot',
-                status='failed',
-                details={'error': error_msg, 'previous_state': state}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'previous_state': state,
-                    'success': False
-                }
-            }
-        
-        # Get parameters from state or config
-        target_snapshot_name = state.get('target_snapshot_name') or config.get('target_snapshot_name')
-        target_cluster_id = state.get('target_cluster_id') or config.get('target_cluster_id')
-        target_region = state.get('target_region') or config.get('target_region')
-        
-        # Validate required parameters
+        Raises:
+            ValueError: If required parameters are missing or invalid
+        """
         required_params = {
-            'target_snapshot_name': target_snapshot_name,
-            'target_cluster_id': target_cluster_id,
-            'target_region': target_region
+            'target_region': self.config.get('target_region'),
+            'target_cluster_id': self.config.get('target_cluster_id'),
+            'target_subnet_group': self.config.get('target_subnet_group'),
+            'target_security_groups': self.config.get('target_security_groups')
         }
         
         missing_params = validate_required_params(required_params)
         if missing_params:
-            error_msg = f"Missing required parameters: {', '.join(missing_params)}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='restore_snapshot',
-                status='failed',
-                details={'error': error_msg, 'missing_params': missing_params}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
-        # Validate region
-        if not validate_region(target_region):
-            error_msg = f"Invalid region: {target_region}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='restore_snapshot',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        if not validate_region(self.config['target_region']):
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
         
-        # Initialize RDS client
+        if not validate_cluster_id(self.config['target_cluster_id']):
+            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
+        
+        if not self.config.get('target_security_groups'):
+            raise ValueError("Target security groups are required")
+    
+    def validate_snapshot_params(self, event: Dict[str, Any]) -> None:
+        """
+        Validate snapshot parameters from event.
+        
+        Args:
+            event: Lambda event
+            
+        Raises:
+            ValueError: If required snapshot parameters are missing or invalid
+        """
+        required_params = {
+            'target_snapshot_name': event.get('target_snapshot_name'),
+            'target_snapshot_arn': event.get('target_snapshot_arn')
+        }
+        
+        missing_params = validate_required_params(required_params)
+        if missing_params:
+            raise ValueError(f"Missing required snapshot parameters: {', '.join(missing_params)}")
+        
+        if not validate_snapshot_name(event['target_snapshot_name']):
+            raise ValueError(f"Invalid target snapshot name: {event['target_snapshot_name']}")
+    
+    def initialize_rds_client(self) -> None:
+        """
+        Initialize RDS client for target region.
+        
+        Raises:
+            ValueError: If target region is not set
+        """
+        if not self.config.get('target_region'):
+            raise ValueError("Target region is required")
+        
+        self.rds_client = get_client('rds', self.config['target_region'])
+    
+    def check_snapshot_exists(self, snapshot_arn: str) -> Dict[str, Any]:
+        """
+        Check if the snapshot exists and get its details.
+        
+        Args:
+            snapshot_arn: ARN of the snapshot to check
+            
+        Returns:
+            Dict[str, Any]: Snapshot details
+            
+        Raises:
+            Exception: If snapshot check fails
+        """
         try:
-            rds_client = boto3.client('rds', region_name=target_region)
+            response = this.rds_client.describe_db_cluster_snapshots(
+                DBClusterSnapshotIdentifier=snapshot_arn
+            )
+            
+            if not response['DBClusterSnapshots']:
+                raise ValueError(f"Snapshot {snapshot_arn} not found")
+            
+            return response['DBClusterSnapshots'][0]
         except Exception as e:
-            error_msg = f"Failed to initialize RDS client: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='restore_snapshot',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            
-            # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='restore_snapshot_failures',
-                value=1,
-                unit='Count'
-            )
-            
-            return {
-                'statusCode': 500,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            handle_aws_error(e, f"Error checking if snapshot {snapshot_arn} exists")
+            raise
+    
+    def check_cluster_exists(self, cluster_id: str) -> bool:
+        """
+        Check if the RDS cluster exists.
         
-        # Check if cluster already exists
+        Args:
+            cluster_id: ID of the cluster to check
+            
+        Returns:
+            bool: True if cluster exists, False otherwise
+            
+        Raises:
+            Exception: If check fails
+        """
         try:
-            logger.info(f"Checking if cluster {target_cluster_id} already exists")
-            existing_clusters = rds_client.describe_db_clusters(
-                DBClusterIdentifier=target_cluster_id
+            response = this.rds_client.describe_db_clusters(
+                DBClusterIdentifier=cluster_id
             )
             
-            if existing_clusters.get('DBClusters'):
-                cluster_status = existing_clusters['DBClusters'][0]['Status']
-                logger.info(f"Cluster {target_cluster_id} already exists with status {cluster_status}")
-                
-                # Update state
-                state_update = {
-                    'operation_id': operation_id,
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_cluster_id': target_cluster_id,
-                    'target_region': target_region,
-                    'restore_status': 'already_exists',
-                    'cluster_status': cluster_status,
-                    'success': True
-                }
-                save_state(operation_id, state_update)
-                
-                # Log audit event
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='restore_snapshot',
-                    status='success',
-                    details={
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_cluster_id': target_cluster_id,
-                        'target_region': target_region,
-                        'restore_status': 'already_exists',
-                        'cluster_status': cluster_status,
-                        'message': 'Cluster already exists, no action needed'
-                    }
-                )
-                
-                # Update metrics
-                duration = time.time() - start_time
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_duration',
-                    value=duration,
-                    unit='Seconds'
-                )
-                
-                return {
-                    'statusCode': 200,
-                    'body': {
-                        'message': f"Cluster {target_cluster_id} already exists with status {cluster_status}",
-                        'operation_id': operation_id,
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_cluster_id': target_cluster_id,
-                        'target_region': target_region,
-                        'restore_status': 'already_exists',
-                        'cluster_status': cluster_status,
-                        'success': True
-                    }
-                }
-                
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'DBClusterNotFoundFault':
-                error_details = handle_aws_error(e, operation_id, 'restore_snapshot')
-                
-                # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_failures',
-                    value=1,
-                    unit='Count'
-                )
-                
-                return {
-                    'statusCode': error_details.get('statusCode', 500),
-                    'body': {
-                        'message': error_details.get('message', 'Failed to check if cluster exists'),
-                        'operation_id': operation_id,
-                        'error': error_details.get('error', str(e)),
-                        'success': False
-                    }
-                }
+            return len(response['DBClusters']) > 0
+        except Exception as e:
+            if 'DBClusterNotFoundFault' in str(e):
+                return False
+            
+            handle_aws_error(e, f"Error checking if cluster {cluster_id} exists")
+            raise
+    
+    def restore_from_snapshot(self, snapshot_arn: str, cluster_id: str) -> Dict[str, Any]:
+        """
+        Restore an Aurora cluster from a snapshot.
         
-        # Get DB snapshot details to get parameters for restore
+        Args:
+            snapshot_arn: ARN of the snapshot to restore from
+            cluster_id: ID for the restored cluster
+            
+        Returns:
+            Dict[str, Any]: Restore response
+            
+        Raises:
+            Exception: If restore fails
+        """
         try:
-            logger.info(f"Getting details for snapshot {target_snapshot_name}")
-            snapshot_response = rds_client.describe_db_cluster_snapshots(
-                DBClusterSnapshotIdentifier=target_snapshot_name
-            )
-            
-            if not snapshot_response.get('DBClusterSnapshots'):
-                error_msg = f"Snapshot {target_snapshot_name} not found in region {target_region}"
-                logger.error(error_msg)
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='restore_snapshot',
-                    status='failed',
-                    details={
-                        'error': error_msg,
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_region': target_region
-                    }
-                )
-                
-                # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_failures',
-                    value=1,
-                    unit='Count'
-                )
-                
-                return {
-                    'statusCode': 404,
-                    'body': {
-                        'message': error_msg,
-                        'operation_id': operation_id,
-                        'success': False
-                    }
-                }
-            
-            snapshot = snapshot_response['DBClusterSnapshots'][0]
-            
-            # Ensure snapshot is available
-            if snapshot['Status'] != 'available':
-                error_msg = f"Snapshot {target_snapshot_name} is not available (status: {snapshot['Status']})"
-                logger.error(error_msg)
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='restore_snapshot',
-                    status='failed',
-                    details={
-                        'error': error_msg,
-                        'target_snapshot_name': target_snapshot_name,
-                        'snapshot_status': snapshot['Status']
-                    }
-                )
-                
-                # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_failures',
-                    value=1,
-                    unit='Count'
-                )
-                
-                return {
-                    'statusCode': 400,
-                    'body': {
-                        'message': error_msg,
-                        'operation_id': operation_id,
-                        'snapshot_status': snapshot['Status'],
-                        'success': False
-                    }
-                }
-                
-            # Get VPC and subnet group details from snapshot
-            source_vpc = snapshot.get('VpcId')
-            db_subnet_group = snapshot.get('DBSubnetGroup')
-            
-            # Additional restore parameters from config
-            restore_params = config.get('restore_params', {})
-            
             # Prepare restore parameters
-            params = {
-                'DBClusterIdentifier': target_cluster_id,
-                'SnapshotIdentifier': target_snapshot_name,
-                'Engine': snapshot.get('Engine', 'aurora-postgresql'),
-                'DBSubnetGroupName': restore_params.get('db_subnet_group_name', db_subnet_group),
-                'VpcSecurityGroupIds': restore_params.get('vpc_security_group_ids', []),
-                'Tags': [
-                    {
-                        'Key': 'Name',
-                        'Value': target_cluster_id
-                    },
-                    {
-                        'Key': 'Environment',
-                        'Value': restore_params.get('environment', 'dev')
-                    },
-                    {
-                        'Key': 'CreatedBy',
-                        'Value': 'aurora-restore-pipeline'
-                    },
-                    {
-                        'Key': 'OperationId',
-                        'Value': operation_id
-                    }
-                ],
-                'CopyTagsToSnapshot': True,
-                'DeletionProtection': restore_params.get('deletion_protection', False)
+            restore_params = {
+                'DBClusterIdentifier': cluster_id,
+                'DBClusterSnapshotIdentifier': snapshot_arn,
+                'DBSubnetGroupName': self.config['target_subnet_group'],
+                'VpcSecurityGroupIds': self.config['target_security_groups'],
+                'Engine': 'aurora-postgresql',  # Default to Aurora PostgreSQL
+                'EngineVersion': self.config.get('target_engine_version', '13.7'),
+                'Port': self.config.get('target_port', 5432),
+                'EnableIAMDatabaseAuthentication': True,
+                'EnableCloudwatchLogsExports': ['postgresql', 'upgrade']
             }
             
-            # Add optional parameters if specified in config
-            if 'port' in restore_params:
-                params['Port'] = restore_params['port']
-                
-            if 'availability_zones' in restore_params:
-                params['AvailabilityZones'] = restore_params['availability_zones']
-                
-            if 'enable_iam_database_authentication' in restore_params:
-                params['EnableIAMDatabaseAuthentication'] = restore_params['enable_iam_database_authentication']
-                
-            if 'storage_encrypted' in restore_params:
-                params['StorageEncrypted'] = restore_params['storage_encrypted']
-                
-            if 'kms_key_id' in restore_params:
-                params['KmsKeyId'] = restore_params['kms_key_id']
-                
-            # Restore from snapshot
-            try:
-                logger.info(f"Restoring cluster {target_cluster_id} from snapshot {target_snapshot_name}")
-                response = rds_client.restore_db_cluster_from_snapshot(**params)
-                
-                # Extract cluster details
-                cluster = response['DBCluster']
-                
-                # Update state
-                state_update = {
-                    'operation_id': operation_id,
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_cluster_id': target_cluster_id,
-                    'target_region': target_region,
-                    'restore_status': 'in_progress',
-                    'cluster_status': cluster['Status'],
-                    'cluster_arn': cluster['DBClusterArn'],
-                    'vpc_id': cluster['VpcId'],
-                    'db_subnet_group': cluster['DBSubnetGroup'],
-                    'success': True
-                }
-                save_state(operation_id, state_update)
-                
-                # Log audit event
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='restore_snapshot',
-                    status='success',
-                    details={
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_cluster_id': target_cluster_id,
-                        'target_region': target_region,
-                        'restore_status': 'in_progress',
-                        'cluster_arn': cluster['DBClusterArn'],
-                        'cluster_status': cluster['Status'],
-                        'message': 'Cluster restore initiated successfully'
-                    }
-                )
-                
-                # Update metrics
-                duration = time.time() - start_time
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_duration',
-                    value=duration,
-                    unit='Seconds'
-                )
-                
-                return {
-                    'statusCode': 200,
-                    'body': {
-                        'message': f"Initiated restore of {target_cluster_id} from snapshot {target_snapshot_name}",
-                        'operation_id': operation_id,
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_cluster_id': target_cluster_id,
-                        'target_region': target_region,
-                        'restore_status': 'in_progress',
-                        'cluster_status': cluster['Status'],
-                        'success': True
-                    }
-                }
+            # Add KMS key if available
+            if self.config.get('target_kms_key_id'):
+                restore_params['KmsKeyId'] = self.config['target_kms_key_id']
             
-            except ClientError as e:
-                error_details = handle_aws_error(e, operation_id, 'restore_snapshot')
+            # Add backup retention period if available
+            if self.config.get('target_backup_retention_period'):
+                restore_params['BackupRetentionPeriod'] = int(self.config['target_backup_retention_period'])
+            
+            # Add parameter group if available
+            if self.config.get('target_parameter_group'):
+                restore_params['DBClusterParameterGroupName'] = self.config['target_parameter_group']
+            
+            # Restore the cluster
+            response = this.rds_client.restore_db_cluster_from_snapshot(**restore_params)
+            
+            return response['DBCluster']
+        except Exception as e:
+            handle_aws_error(e, f"Error restoring cluster {cluster_id} from snapshot {snapshot_arn}")
+            raise
+    
+    def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        """
+        Process the Lambda event.
+        
+        Args:
+            event: Lambda event
+            context: Lambda context
+            
+        Returns:
+            Dict[str, Any]: Lambda response
+        """
+        try:
+            # Get operation ID
+            operation_id = this.get_operation_id(event)
+            
+            # Validate configuration
+            this.validate_config()
+            
+            # Validate snapshot parameters
+            this.validate_snapshot_params(event)
+            
+            # Initialize RDS client
+            this.initialize_rds_client()
+            
+            # Get snapshot and cluster details
+            snapshot_arn = event['target_snapshot_arn']
+            cluster_id = this.config['target_cluster_id']
+            
+            # Check if snapshot exists
+            snapshot_details = this.check_snapshot_exists(snapshot_arn)
+            
+            # Check if cluster already exists
+            cluster_exists = this.check_cluster_exists(cluster_id)
+            
+            if cluster_exists:
+                # Cluster already exists, cannot restore
+                error_message = f"Cluster {cluster_id} already exists, cannot restore from snapshot"
+                logger.error(error_message)
                 
-                # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='restore_snapshot_failures',
-                    value=1,
-                    unit='Count'
-                )
-                
-                return {
-                    'statusCode': error_details.get('statusCode', 500),
-                    'body': {
-                        'message': error_details.get('message', 'Failed to restore snapshot'),
-                        'operation_id': operation_id,
-                        'error': error_details.get('error', str(e)),
-                        'success': False
-                    }
+                # Save state with error
+                state_data = {
+                    'target_cluster_id': cluster_id,
+                    'target_snapshot_name': event['target_snapshot_name'],
+                    'target_snapshot_arn': snapshot_arn,
+                    'cluster_exists': True,
+                    'restore_status': 'failed',
+                    'status': 'failed',
+                    'success': False,
+                    'error': error_message
                 }
                 
-        except ClientError as e:
-            error_details = handle_aws_error(e, operation_id, 'restore_snapshot')
+                this.save_state(state_data)
+                
+                # Log audit with failure
+                this.log_audit(operation_id, 'FAILED', {
+                    'target_cluster_id': cluster_id,
+                    'target_snapshot_name': event['target_snapshot_name'],
+                    'error': error_message
+                })
+                
+                # Update metrics with failure
+                this.update_metrics(operation_id, 'restore_failure', 1)
+                
+                return this.create_response(operation_id, {
+                    'message': error_message,
+                    'target_cluster_id': cluster_id,
+                    'target_snapshot_name': event['target_snapshot_name'],
+                    'next_step': None
+                }, 500)
+            
+            # Restore from snapshot
+            restore_response = this.restore_from_snapshot(snapshot_arn, cluster_id)
+            
+            # Save state
+            state_data = {
+                'target_cluster_id': cluster_id,
+                'target_snapshot_name': event['target_snapshot_name'],
+                'target_snapshot_arn': snapshot_arn,
+                'cluster_exists': False,
+                'restore_status': restore_response['Status'],
+                'status': 'restoring',
+                'success': True
+            }
+            
+            this.save_state(state_data)
+            
+            # Log audit
+            this.log_audit(operation_id, 'SUCCESS', {
+                'target_cluster_id': cluster_id,
+                'target_snapshot_name': event['target_snapshot_name'],
+                'restore_status': restore_response['Status']
+            })
             
             # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='restore_snapshot_failures',
-                value=1,
-                unit='Count'
-            )
+            this.update_metrics(operation_id, 'cluster_restored', 1)
             
-            return {
-                'statusCode': error_details.get('statusCode', 500),
-                'body': {
-                    'message': error_details.get('message', 'Failed to get snapshot details'),
-                    'operation_id': operation_id,
-                    'error': error_details.get('error', str(e)),
-                    'success': False
-                }
-            }
+            # Trigger next step
+            trigger_next_step(operation_id, 'check_restore_status', state_data)
             
-    except Exception as e:
-        error_msg = f"Error in restore_snapshot: {str(e)}"
-        logger.error(error_msg, exc_info=True)
+            return this.create_response(operation_id, {
+                'message': f"Cluster {cluster_id} restore initiated",
+                'target_cluster_id': cluster_id,
+                'target_snapshot_name': event['target_snapshot_name'],
+                'restore_status': restore_response['Status'],
+                'next_step': 'check_restore_status'
+            })
+        except Exception as e:
+            return this.handle_error(operation_id, e, {
+                'target_cluster_id': this.config.get('target_cluster_id'),
+                'target_snapshot_name': event.get('target_snapshot_name')
+            })
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Lambda handler function.
+    
+    Args:
+        event: Lambda event
+        context: Lambda context
         
-        # Log audit event for failure
-        log_audit_event(
-            operation_id=operation_id,
-            event_type='restore_snapshot',
-            status='failed',
-            details={
-                'error': error_msg
-            }
-        )
-        
-        # Update metrics
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='restore_snapshot_failures',
-            value=1,
-            unit='Count'
-        )
-        
-        return {
-            'statusCode': 500,
-            'body': {
-                'message': 'Failed to restore snapshot',
-                'operation_id': operation_id,
-                'error': str(e),
-                'success': False
-            }
-        } 
+    Returns:
+        Dict[str, Any]: Lambda response
+    """
+    handler = RestoreSnapshotHandler()
+    return handler.execute(event, context) 

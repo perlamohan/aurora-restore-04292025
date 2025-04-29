@@ -5,313 +5,199 @@ Lambda function to send SNS notification about the restore process completion.
 
 import json
 import time
-from typing import Dict, Any
-from botocore.exceptions import ClientError
+from typing import Dict, Any, Optional
 
-from utils.common import (
-    logger,
-    get_config,
-    log_audit_event,
-    update_metrics,
-    validate_required_params,
-    validate_region,
-    send_notification,
-    get_operation_id,
-    save_state,
-    handle_aws_error,
-    trigger_next_step
-)
+from utils.base_handler import BaseHandler
+from utils.common import logger
+from utils.validation import validate_required_params, validate_region
+from utils.aws_utils import handle_aws_error
 
-def lambda_handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    """
-    Send SNS notification about the restore process completion.
+class SNSNotificationHandler(BaseHandler):
+    """Handler for sending SNS notifications about restore process completion."""
     
-    Args:
-        event: Lambda event containing:
-            - operation_id: Optional operation ID for retry scenarios
-            - target_region: Target region of the restored cluster
-            - cluster_endpoint: Optional endpoint of the restored cluster
-        context: Lambda context
-        
-    Returns:
-        dict: Response containing:
-            - statusCode: HTTP status code
-            - body: Response body with operation details
-    """
-    start_time = time.time()
-    operation_id = get_operation_id(event)
+    def __init__(self):
+        """Initialize the SNS notification handler."""
+        super().__init__('sns_notification')
     
-    try:
-        # Get configuration
-        config = get_config()
-        target_region = config.get('target_region')
+    def validate_config(self) -> None:
+        """
+        Validate required configuration parameters.
         
-        # Load previous state
-        state = load_state(operation_id)
-        if not state:
-            error_msg = f"No previous state found for operation {operation_id}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
-            
-        if not state.get('success', False):
-            error_msg = f"Previous step failed for operation {operation_id}"
-            logger.warning(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg, 'previous_state': state}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'previous_state': state,
-                    'success': False
-                }
-            }
-        
-        # Get details from state
-        target_cluster_id = state.get('target_cluster_id', config.get('target_cluster_id'))
-        cluster_endpoint = state.get('cluster_endpoint')
-        cluster_port = state.get('cluster_port')
-        target_snapshot_name = state.get('target_snapshot_name')
-        archive_status = state.get('archive_status')
-        
-        # Validate required parameters
+        Raises:
+            ValueError: If required parameters are missing or invalid
+        """
         required_params = {
-            'target_region': target_region,
-            'target_cluster_id': target_cluster_id
+            'target_region': self.config.get('target_region'),
+            'sns_topic_arn': self.config.get('sns_topic_arn')
         }
         
         missing_params = validate_required_params(required_params)
         if missing_params:
-            error_msg = f"Missing required parameters: {', '.join(missing_params)}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg, 'missing_params': missing_params}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
-        # Validate region
-        if not validate_region(target_region):
-            error_msg = f"Invalid region: {target_region}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        if not validate_region(self.config['target_region']):
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
+    
+    def get_notification_details(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Get notification details from state or event.
         
-        # Get SNS topic ARN from config
-        sns_topic_arn = config.get('sns_topic_arn')
-        if not sns_topic_arn:
-            error_msg = f"Missing sns_topic_arn in config for operation {operation_id}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg}
-            )
+        Args:
+            event: Lambda event
             
-            # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='sns_notification_failures',
-                value=1,
-                unit='Count'
-            )
+        Returns:
+            Dict[str, Any]: Notification details
             
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        Raises:
+            ValueError: If required details are missing
+        """
+        state = self.load_state()
         
-        # Prepare notification message
-        timestamp = int(time.time())
-        message = {
-            'operation_id': operation_id,
-            'status': 'SUCCESS',
-            'timestamp': timestamp,
-            'cluster_id': target_cluster_id,
-            'region': target_region,
-            'endpoint': cluster_endpoint,
-            'port': cluster_port,
-            'target_snapshot_name': target_snapshot_name,
-            'archive_status': archive_status
+        details = {
+            'target_cluster_id': state.get('target_cluster_id', self.config.get('target_cluster_id')),
+            'target_region': state.get('target_region', self.config.get('target_region')),
+            'cluster_endpoint': state.get('cluster_endpoint'),
+            'cluster_port': state.get('cluster_port'),
+            'target_snapshot_name': state.get('target_snapshot_name'),
+            'archive_status': state.get('archive_status')
         }
         
-        # Send notification
+        if not details['target_cluster_id']:
+            raise ValueError("Target cluster ID is required")
+        
+        if not details['target_region']:
+            raise ValueError("Target region is required")
+        
+        return details
+    
+    def prepare_notification_message(self, details: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Prepare the notification message.
+        
+        Args:
+            details: Notification details
+            
+        Returns:
+            Dict[str, Any]: Prepared message
+        """
+        return {
+            'operation_id': self.operation_id,
+            'status': 'SUCCESS',
+            'timestamp': int(time.time()),
+            'cluster_id': details['target_cluster_id'],
+            'region': details['target_region'],
+            'endpoint': details['cluster_endpoint'],
+            'port': details['cluster_port'],
+            'target_snapshot_name': details['target_snapshot_name'],
+            'archive_status': details['archive_status']
+        }
+    
+    def send_notification(self, details: Dict[str, Any], message: Dict[str, Any]) -> None:
+        """
+        Send the SNS notification.
+        
+        Args:
+            details: Notification details
+            message: Prepared message
+            
+        Raises:
+            Exception: If notification fails
+        """
         try:
-            logger.info(f"Sending notification for operation {operation_id}")
-            send_notification(
-                topic_arn=sns_topic_arn,
-                subject=f"Aurora Restore Complete - {target_cluster_id}",
+            logger.info(f"Sending notification for operation {self.operation_id}")
+            self.send_sns_notification(
+                topic_arn=self.config['sns_topic_arn'],
+                subject=f"Aurora Restore Complete - {details['target_cluster_id']}",
                 message=json.dumps(message, indent=2)
             )
         except Exception as e:
-            error_msg = f"Failed to send notification: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='sns_notification',
-                status='failed',
-                details={'error': error_msg}
-            )
-            
-            # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='sns_notification_failures',
-                value=1,
-                unit='Count'
-            )
-            
-            return {
-                'statusCode': 500,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            handle_aws_error(e, self.operation_id, self.step_name)
+            raise
+    
+    def handle_notification_sent(self, details: Dict[str, Any], message: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle successful notification.
         
+        Args:
+            details: Notification details
+            message: Prepared message
+            
+        Returns:
+            Dict[str, Any]: Response
+        """
         # Update state
-        state_update = {
-            'operation_id': operation_id,
-            'target_cluster_id': target_cluster_id,
-            'target_region': target_region,
-            'cluster_endpoint': cluster_endpoint,
-            'cluster_port': cluster_port,
+        state = {
+            'target_cluster_id': details['target_cluster_id'],
+            'target_region': details['target_region'],
+            'cluster_endpoint': details['cluster_endpoint'],
+            'cluster_port': details['cluster_port'],
             'notification_sent': True,
-            'timestamp': timestamp,
+            'timestamp': message['timestamp'],
             'success': True
         }
-        save_state(operation_id, state_update)
         
-        # Log audit event
-        log_audit_event(
-            operation_id=operation_id,
-            event_type='sns_notification',
-            status='success',
-            details={
-                'target_cluster_id': target_cluster_id,
-                'target_region': target_region,
-                'cluster_endpoint': cluster_endpoint,
-                'notification_sent': True,
-                'timestamp': timestamp
-            }
-        )
-        
-        # Update metrics
-        duration = time.time() - start_time
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='sns_notification_duration',
-            value=duration,
-            unit='Seconds'
-        )
+        self.save_state(state)
         
         return {
-            'statusCode': 200,
-            'body': {
-                'message': 'Notification sent successfully',
-                'operation_id': operation_id,
-                'target_cluster_id': target_cluster_id,
-                'target_region': target_region,
-                'cluster_endpoint': cluster_endpoint,
-                'timestamp': timestamp,
-                'success': True
-            }
+            'message': 'Notification sent successfully',
+            'target_cluster_id': details['target_cluster_id'],
+            'target_region': details['target_region'],
+            'cluster_endpoint': details['cluster_endpoint'],
+            'timestamp': message['timestamp']
         }
+    
+    def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        """
+        Process the SNS notification request.
         
-    except ClientError as e:
-        error_details = handle_aws_error(e, operation_id, 'sns_notification')
+        Args:
+            event: Lambda event
+            context: Lambda context
+            
+        Returns:
+            dict: Processing result
+        """
+        start_time = time.time()
         
-        # Update metrics
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='sns_notification_failures',
-            value=1,
-            unit='Count'
-        )
+        try:
+            # Validate configuration
+            self.validate_config()
+            
+            # Get notification details
+            details = self.get_notification_details(event)
+            
+            # Prepare and send notification
+            message = self.prepare_notification_message(details)
+            self.send_notification(details, message)
+            
+            result = self.handle_notification_sent(details, message)
+            
+            # Update metrics
+            duration = time.time() - start_time
+            self.update_metrics('sns_notification_duration', duration, 'Seconds')
+            
+            return result
+            
+        except Exception as e:
+            # Update metrics for failure
+            duration = time.time() - start_time
+            self.update_metrics('sns_notification_duration', duration, 'Seconds')
+            self.update_metrics('sns_notification_failures', 1, 'Count')
+            
+            raise
+
+# Initialize handler
+handler = SNSNotificationHandler()
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Lambda handler for sending SNS notification about restore process completion.
+    
+    Args:
+        event: Lambda event
+        context: Lambda context
         
-        return {
-            'statusCode': error_details.get('statusCode', 500),
-            'body': {
-                'message': error_details.get('message', 'Failed to send notification'),
-                'operation_id': operation_id,
-                'error': error_details.get('error', str(e)),
-                'success': False
-            }
-        }
-        
-    except Exception as e:
-        error_msg = f"Error in sns_notification: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        
-        # Log audit event for failure
-        log_audit_event(
-            operation_id=operation_id,
-            event_type='sns_notification',
-            status='failed',
-            details={
-                'error': str(e)
-            }
-        )
-        
-        # Update metrics
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='sns_notification_failures',
-            value=1,
-            unit='Count'
-        )
-        
-        return {
-            'statusCode': 500,
-            'body': {
-                'message': 'Failed to send notification',
-                'operation_id': operation_id,
-                'error': str(e),
-                'success': False
-            }
-        } 
+    Returns:
+        dict: Response
+    """
+    return handler.execute(event, context) 

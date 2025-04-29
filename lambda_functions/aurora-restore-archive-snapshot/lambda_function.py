@@ -4,358 +4,253 @@ Lambda function to archive a snapshot after a successful restore.
 """
 
 import time
-import boto3
-from typing import Dict, Any
-from botocore.exceptions import ClientError
+from typing import Dict, Any, Optional, Tuple
 
-from utils.common import (
-    logger,
-    get_config,
-    log_audit_event,
-    update_metrics,
-    validate_required_params,
-    validate_region,
-    get_operation_id,
-    load_state,
-    save_state,
-    handle_aws_error
-)
+from utils.base_handler import BaseHandler
+from utils.common import logger
+from utils.validation import validate_required_params, validate_region
+from utils.aws_utils import get_client, handle_aws_error
 
-def lambda_handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    """
-    Archive a snapshot after a successful restore.
+class ArchiveSnapshotHandler(BaseHandler):
+    """Handler for archiving a snapshot after a successful restore."""
     
-    Args:
-        event: Lambda event containing:
-            - operation_id: Optional operation ID for retry scenarios
-            - target_snapshot_name: Name of the snapshot to archive
-            - target_region: Region where the snapshot is located
-        context: Lambda context
-        
-    Returns:
-        dict: Response containing:
-            - statusCode: HTTP status code
-            - body: Response body with operation details
-    """
-    start_time = time.time()
-    operation_id = get_operation_id(event)
+    def __init__(self):
+        """Initialize the archive snapshot handler."""
+        super().__init__('archive_snapshot')
+        self.rds_client = None
     
-    try:
-        # Get configuration
-        config = get_config()
-        target_region = config.get('target_region')
+    def validate_config(self) -> None:
+        """
+        Validate required configuration parameters.
         
-        # Load previous state
-        state = load_state(operation_id)
-        if not state:
-            error_msg = f"No previous state found for operation {operation_id}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='failed',
-                details={'error': error_msg}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
-            
-        if not state.get('success', False):
-            error_msg = f"Previous step failed for operation {operation_id}"
-            logger.warning(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='failed',
-                details={'error': error_msg, 'previous_state': state}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'previous_state': state,
-                    'success': False
-                }
-            }
-        
-        # Get target snapshot name from state
-        target_snapshot_name = state.get('target_snapshot_name')
-        
-        # Validate required parameters
+        Raises:
+            ValueError: If required parameters are missing or invalid
+        """
         required_params = {
-            'target_region': target_region,
-            'target_snapshot_name': target_snapshot_name
+            'target_region': self.config.get('target_region')
         }
         
         missing_params = validate_required_params(required_params)
         if missing_params:
-            error_msg = f"Missing required parameters: {', '.join(missing_params)}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='failed',
-                details={'error': error_msg, 'missing_params': missing_params}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
-        # Validate region
-        if not validate_region(target_region):
-            error_msg = f"Invalid region: {target_region}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        if not validate_region(self.config['target_region']):
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
+    
+    def get_snapshot_details(self, event: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Get snapshot details from event or state.
         
-        # Initialize RDS client
+        Args:
+            event: Lambda event
+            
+        Returns:
+            Tuple[str, str]: Target snapshot name and region
+            
+        Raises:
+            ValueError: If snapshot details are missing
+        """
+        state = self.load_state()
+        
+        target_snapshot_name = state.get('target_snapshot_name')
+        target_region = (
+            state.get('target_region') or 
+            event.get('target_region') or 
+            self.config.get('target_region')
+        )
+        
+        if not target_snapshot_name:
+            raise ValueError("Target snapshot name is required")
+        
+        if not target_region:
+            raise ValueError("Target region is required")
+        
+        return target_snapshot_name, target_region
+    
+    def initialize_rds_client(self, region: str) -> None:
+        """
+        Initialize RDS client for target region.
+        
+        Args:
+            region: AWS region
+            
+        Raises:
+            Exception: If client initialization fails
+        """
         try:
-            rds_client = boto3.client('rds', region_name=target_region)
+            self.rds_client = get_client('rds', region_name=region)
         except Exception as e:
-            error_msg = f"Failed to initialize RDS client: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            return {
-                'statusCode': 500,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            raise Exception(f"Failed to create RDS client for region {region}: {str(e)}")
+    
+    def check_snapshot_exists(self, snapshot_name: str) -> bool:
+        """
+        Check if the snapshot exists.
         
-        # Check if snapshot exists
+        Args:
+            snapshot_name: Name of the snapshot to check
+            
+        Returns:
+            bool: True if snapshot exists, False otherwise
+            
+        Raises:
+            Exception: If check fails
+        """
         try:
-            logger.info(f"Checking if snapshot {target_snapshot_name} exists in {target_region}")
-            response = rds_client.describe_db_cluster_snapshots(
-                DBClusterSnapshotIdentifier=target_snapshot_name
+            logger.info(f"Checking if snapshot {snapshot_name} exists")
+            response = self.rds_client.describe_db_cluster_snapshots(
+                DBClusterSnapshotIdentifier=snapshot_name
             )
             
-            if not response.get('DBClusterSnapshots'):
-                logger.info(f"Snapshot {target_snapshot_name} does not exist in {target_region}, no action needed")
-                
-                # Update state
-                state_update = {
-                    'operation_id': operation_id,
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_region': target_region,
-                    'archive_status': 'skipped',
-                    'success': True
-                }
-                save_state(operation_id, state_update)
-                
-                # Log audit event
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='archive_snapshot',
-                    status='success',
-                    details={
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_region': target_region,
-                        'archive_status': 'skipped',
-                        'message': 'Snapshot does not exist, no action needed'
-                    }
-                )
-                
-                return {
-                    'statusCode': 200,
-                    'body': {
-                        'message': f"Snapshot {target_snapshot_name} does not exist, no action needed",
-                        'operation_id': operation_id,
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_region': target_region,
-                        'archive_status': 'skipped',
-                        'success': True
-                    }
-                }
-                
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'DBClusterSnapshotNotFoundFault':
-                logger.info(f"Snapshot {target_snapshot_name} does not exist in {target_region}, no action needed")
-                
-                # Update state
-                state_update = {
-                    'operation_id': operation_id,
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_region': target_region,
-                    'archive_status': 'skipped',
-                    'success': True
-                }
-                save_state(operation_id, state_update)
-                
-                # Log audit event
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='archive_snapshot',
-                    status='success',
-                    details={
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_region': target_region,
-                        'archive_status': 'skipped',
-                        'message': 'Snapshot does not exist, no action needed'
-                    }
-                )
-                
-                return {
-                    'statusCode': 200,
-                    'body': {
-                        'message': f"Snapshot {target_snapshot_name} does not exist, no action needed",
-                        'operation_id': operation_id,
-                        'target_snapshot_name': target_snapshot_name,
-                        'target_region': target_region,
-                        'archive_status': 'skipped',
-                        'success': True
-                    }
-                }
-            else:
-                error_details = handle_aws_error(e, operation_id, 'archive_snapshot')
+            return bool(response.get('DBClusterSnapshots'))
+            
+        except Exception as e:
+            if 'DBClusterSnapshotNotFoundFault' in str(e):
+                logger.info(f"Snapshot {snapshot_name} does not exist")
+                return False
+            handle_aws_error(e, self.operation_id, self.step_name)
+            raise
+    
+    def delete_snapshot(self, snapshot_name: str) -> None:
+        """
+        Delete the snapshot.
+        
+        Args:
+            snapshot_name: Name of the snapshot to delete
+            
+        Raises:
+            Exception: If deletion fails
+        """
+        try:
+            logger.info(f"Deleting snapshot {snapshot_name}")
+            self.rds_client.delete_db_cluster_snapshot(
+                DBClusterSnapshotIdentifier=snapshot_name
+            )
+        except Exception as e:
+            handle_aws_error(e, self.operation_id, self.step_name)
+            raise
+    
+    def handle_snapshot_not_found(self, snapshot_name: str, region: str) -> Dict[str, Any]:
+        """
+        Handle case where snapshot is not found.
+        
+        Args:
+            snapshot_name: Name of the snapshot
+            region: AWS region
+            
+        Returns:
+            Dict[str, Any]: Response
+        """
+        # Update state
+        state = {
+            'target_snapshot_name': snapshot_name,
+            'target_region': region,
+            'archive_status': 'skipped',
+            'success': True
+        }
+        
+        self.save_state(state)
+        
+        return {
+            'message': f"Snapshot {snapshot_name} does not exist, no action needed",
+            'target_snapshot_name': snapshot_name,
+            'target_region': region,
+            'archive_status': 'skipped'
+        }
+    
+    def handle_snapshot_deleted(self, snapshot_name: str, region: str) -> Dict[str, Any]:
+        """
+        Handle case where snapshot is successfully deleted.
+        
+        Args:
+            snapshot_name: Name of the snapshot
+            region: AWS region
+            
+        Returns:
+            Dict[str, Any]: Response
+        """
+        # Update state
+        state = {
+            'target_snapshot_name': snapshot_name,
+            'target_region': region,
+            'archive_status': 'deleted',
+            'success': True
+        }
+        
+        self.save_state(state)
+        
+        return {
+            'message': f"Snapshot {snapshot_name} deleted successfully",
+            'target_snapshot_name': snapshot_name,
+            'target_region': region,
+            'archive_status': 'deleted'
+        }
+    
+    def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        """
+        Process the archive snapshot request.
+        
+        Args:
+            event: Lambda event
+            context: Lambda context
+            
+        Returns:
+            dict: Processing result
+        """
+        start_time = time.time()
+        
+        try:
+            # Validate configuration
+            self.validate_config()
+            
+            # Get snapshot details
+            target_snapshot_name, target_region = self.get_snapshot_details(event)
+            
+            # Initialize RDS client
+            self.initialize_rds_client(target_region)
+            
+            # Check if snapshot exists
+            snapshot_exists = self.check_snapshot_exists(target_snapshot_name)
+            
+            if not snapshot_exists:
+                result = self.handle_snapshot_not_found(target_snapshot_name, target_region)
                 
                 # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='archive_snapshot_failures',
-                    value=1,
-                    unit='Count'
-                )
+                duration = time.time() - start_time
+                self.update_metrics('archive_snapshot_duration', duration, 'Seconds')
                 
-                return {
-                    'statusCode': error_details.get('statusCode', 500),
-                    'body': {
-                        'message': error_details.get('message', 'Failed to check snapshot existence'),
-                        'operation_id': operation_id,
-                        'error': error_details.get('error', str(e)),
-                        'success': False
-                    }
-                }
-        
-        # Delete the snapshot
-        try:
-            logger.info(f"Deleting snapshot {target_snapshot_name} in {target_region}")
-            rds_client.delete_db_cluster_snapshot(
-                DBClusterSnapshotIdentifier=target_snapshot_name
-            )
+                return result
             
-            # Update state
-            state_update = {
-                'operation_id': operation_id,
-                'target_snapshot_name': target_snapshot_name,
-                'target_region': target_region,
-                'archive_status': 'deleted',
-                'success': True
-            }
-            save_state(operation_id, state_update)
+            # Delete the snapshot
+            self.delete_snapshot(target_snapshot_name)
             
-            # Log audit event
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='archive_snapshot',
-                status='success',
-                details={
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_region': target_region,
-                    'archive_status': 'deleted',
-                    'message': 'Snapshot deleted successfully'
-                }
-            )
+            result = self.handle_snapshot_deleted(target_snapshot_name, target_region)
             
             # Update metrics
             duration = time.time() - start_time
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='archive_snapshot_duration',
-                value=duration,
-                unit='Seconds'
-            )
+            self.update_metrics('archive_snapshot_duration', duration, 'Seconds')
             
-            return {
-                'statusCode': 200,
-                'body': {
-                    'message': f"Snapshot {target_snapshot_name} deleted successfully",
-                    'operation_id': operation_id,
-                    'target_snapshot_name': target_snapshot_name,
-                    'target_region': target_region,
-                    'archive_status': 'deleted',
-                    'success': True
-                }
-            }
+            return result
             
-        except ClientError as e:
-            error_details = handle_aws_error(e, operation_id, 'archive_snapshot')
+        except Exception as e:
+            # Update metrics for failure
+            duration = time.time() - start_time
+            self.update_metrics('archive_snapshot_duration', duration, 'Seconds')
+            self.update_metrics('archive_snapshot_failures', 1, 'Count')
             
-            # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='archive_snapshot_failures',
-                value=1,
-                unit='Count'
-            )
-            
-            return {
-                'statusCode': error_details.get('statusCode', 500),
-                'body': {
-                    'message': error_details.get('message', 'Failed to delete snapshot'),
-                    'operation_id': operation_id,
-                    'error': error_details.get('error', str(e)),
-                    'success': False
-                }
-            }
-            
-    except Exception as e:
-        error_msg = f"Error in archive_snapshot: {str(e)}"
-        logger.error(error_msg, exc_info=True)
+            raise
+
+# Initialize handler
+handler = ArchiveSnapshotHandler()
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Lambda handler for archiving a snapshot after a successful restore.
+    
+    Args:
+        event: Lambda event
+        context: Lambda context
         
-        # Log audit event for failure
-        log_audit_event(
-            operation_id=operation_id,
-            event_type='archive_snapshot',
-            status='failed',
-            details={
-                'error': str(e)
-            }
-        )
-        
-        # Update metrics
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='archive_snapshot_failures',
-            value=1,
-            unit='Count'
-        )
-        
-        return {
-            'statusCode': 500,
-            'body': {
-                'message': 'Failed to archive snapshot',
-                'operation_id': operation_id,
-                'error': str(e),
-                'success': False
-            }
-        } 
+    Returns:
+        dict: Response
+    """
+    return handler.execute(event, context) 

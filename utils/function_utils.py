@@ -1,75 +1,105 @@
+#!/usr/bin/env python3
 """
-Function-specific utility functions and imports for Aurora restore Lambda functions.
+Function-specific utilities for Aurora restore Lambda functions.
+This module provides utilities specific to Lambda function operations.
 """
 
 import boto3
 import psycopg2
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from botocore.exceptions import ClientError
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-def validate_db_credentials(credentials: Dict[str, str], is_master: bool = True) -> None:
+from utils.core import get_config
+from utils.aws_utils import get_client
+from utils.validation import validate_db_credentials
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def test_db_connection(host: str, port: int, database: str, username: str, password: str) -> Tuple[bool, Optional[str]]:
     """
-    Validate the database credentials retrieved from Secrets Manager.
+    Test database connection.
     
     Args:
-        credentials: Dictionary containing database credentials
-        is_master: Boolean indicating if these are master credentials
+        host: Database host
+        port: Database port
+        database: Database name
+        username: Database username
+        password: Database password
         
-    Raises:
-        ValueError: If any required credential is missing
+    Returns:
+        Tuple[bool, Optional[str]]: (success, error_message)
     """
-    if is_master:
-        required_fields = ['database', 'username', 'password']
-    else:
-        required_fields = ['app_username', 'app_password', 'readonly_username', 'readonly_password']
-    
-    missing_fields = [field for field in required_fields if field not in credentials]
-    
-    if missing_fields:
-        raise ValueError(f"Missing required database credential fields: {', '.join(missing_fields)}")
+    try:
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            database=database,
+            user=username,
+            password=password,
+            connect_timeout=5
+        )
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
-def validate_snapshot_name(snapshot_name: str) -> None:
+def get_db_connection_info(cluster_id: str, region: str) -> Dict[str, Any]:
     """
-    Validate the snapshot name format.
+    Get database connection information for an Aurora cluster.
     
     Args:
-        snapshot_name: Name of the snapshot to validate
+        cluster_id: The cluster ID
+        region: AWS region
         
-    Raises:
-        ValueError: If the snapshot name is invalid
+    Returns:
+        Dict[str, Any]: Connection information
     """
-    if not snapshot_name:
-        raise ValueError("Snapshot name cannot be empty")
-    
-    if len(snapshot_name) > 255:
-        raise ValueError("Snapshot name cannot be longer than 255 characters")
-    
-    if not snapshot_name[0].isalnum():
-        raise ValueError("Snapshot name must start with an alphanumeric character")
-    
-    valid_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
-    if not all(c in valid_chars for c in snapshot_name):
-        raise ValueError("Snapshot name can only contain letters, numbers, and hyphens")
+    try:
+        rds = get_client('rds', region)
+        response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        
+        if not response['DBClusters']:
+            raise ValueError(f"Cluster {cluster_id} not found")
+            
+        cluster = response['DBClusters'][0]
+        
+        return {
+            'host': cluster['Endpoint'],
+            'port': cluster['Port'],
+            'database': cluster['DatabaseName'],
+            'status': cluster['Status']
+        }
+    except ClientError as e:
+        raise ValueError(f"Error getting cluster info: {str(e)}")
 
-def validate_cluster_id(cluster_id: str) -> None:
+def wait_for_cluster_available(cluster_id: str, region: str, max_attempts: int = 60, delay_seconds: int = 30) -> bool:
     """
-    Validate the cluster ID format.
+    Wait for an Aurora cluster to become available.
     
     Args:
-        cluster_id: ID of the cluster to validate
+        cluster_id: The cluster ID
+        region: AWS region
+        max_attempts: Maximum number of attempts
+        delay_seconds: Delay between attempts
         
-    Raises:
-        ValueError: If the cluster ID is invalid
+    Returns:
+        bool: True if cluster is available
     """
-    if not cluster_id:
-        raise ValueError("Cluster ID cannot be empty")
+    rds = get_client('rds', region)
     
-    if len(cluster_id) > 63:
-        raise ValueError("Cluster ID cannot be longer than 63 characters")
+    @retry(stop=stop_after_attempt(max_attempts), wait=wait_exponential(multiplier=delay_seconds, min=delay_seconds, max=300))
+    def check_status() -> bool:
+        response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        status = response['DBClusters'][0]['Status']
+        
+        if status == 'available':
+            return True
+        elif status in ['failed', 'incompatible-restore']:
+            raise ValueError(f"Cluster {cluster_id} is in {status} state")
+            
+        raise Exception(f"Cluster {cluster_id} is in {status} state")
     
-    if not cluster_id[0].isalnum():
-        raise ValueError("Cluster ID must start with an alphanumeric character")
-    
-    valid_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
-    if not all(c in valid_chars for c in cluster_id):
-        raise ValueError("Cluster ID can only contain letters, numbers, and hyphens") 
+    try:
+        return check_status()
+    except Exception:
+        return False 

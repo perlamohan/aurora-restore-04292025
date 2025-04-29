@@ -3,312 +3,251 @@
 Lambda function to check the status of a cluster deletion operation.
 """
 
-import json
 import time
-import boto3
-from typing import Dict, Any, Optional, List
-from botocore.exceptions import ClientError
+from typing import Dict, Any, Optional, List, Tuple
 
-from utils.common import (
-    logger,
-    get_config,
-    log_audit_event,
-    update_metrics,
-    validate_required_params,
-    validate_region,
-    get_operation_id,
-    load_state,
-    save_state,
-    handle_aws_error
-)
+from utils.base_handler import BaseHandler
+from utils.common import logger
+from utils.validation import validate_required_params, validate_region
+from utils.aws_utils import get_client, handle_aws_error
+from utils.state_utils import trigger_next_step
 
-def lambda_handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-    """
-    Check the status of a cluster deletion operation.
+class CheckDeleteStatusHandler(BaseHandler):
+    """Handler for checking RDS cluster deletion status."""
     
-    Args:
-        event: Lambda event containing:
-            - operation_id: Optional operation ID for retry scenarios
-            - target_cluster_id: ID of the cluster being deleted
-            - target_region: AWS region where the cluster exists
-        context: Lambda context
+    def __init__(self):
+        """Initialize the check delete status handler."""
+        super().__init__('check_delete_status')
+        self.rds_client = None
     
-    Returns:
-        dict: Response containing:
-            - statusCode: HTTP status code
-            - body: Response body with operation details
-    """
-    start_time = time.time()
-    operation_id = get_operation_id(event)
-    
-    try:
-        # Get configuration
-        config = get_config()
+    def validate_config(self) -> None:
+        """
+        Validate required configuration parameters.
         
-        # Load previous state
-        state = load_state(operation_id)
-        if not state:
-            error_msg = f"No previous state found for operation {operation_id}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='failed',
-                details={'error': error_msg}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
-            
-        if not state.get('success', False):
-            error_msg = f"Previous step failed for operation {operation_id}"
-            logger.warning(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='failed',
-                details={'error': error_msg, 'previous_state': state}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'previous_state': state,
-                    'success': False
-                }
-            }
-        
-        # Get cluster details from state or config
-        target_cluster_id = state.get('target_cluster_id') or config.get('target_cluster_id')
-        target_region = state.get('target_region') or config.get('target_region')
-        
-        # Validate required parameters
+        Raises:
+            ValueError: If required parameters are missing or invalid
+        """
         required_params = {
-            'target_cluster_id': target_cluster_id,
-            'target_region': target_region
+            'target_cluster_id': self.config.get('target_cluster_id'),
+            'target_region': self.config.get('target_region')
         }
         
         missing_params = validate_required_params(required_params)
         if missing_params:
-            error_msg = f"Missing required parameters: {', '.join(missing_params)}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='failed',
-                details={'error': error_msg, 'missing_params': missing_params}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
         
-        # Validate region
-        if not validate_region(target_region):
-            error_msg = f"Invalid region: {target_region}"
-            logger.error(error_msg)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
-            return {
-                'statusCode': 400,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        if not validate_region(self.config['target_region']):
+            raise ValueError(f"Invalid target region: {self.config['target_region']}")
+    
+    def get_cluster_details(self, event: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Get cluster details from event or state.
         
-        # Initialize RDS client
-        try:
-            rds_client = boto3.client('rds', region_name=target_region)
-        except Exception as e:
-            error_msg = f"Failed to initialize RDS client: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='failed',
-                details={'error': error_msg, 'target_region': target_region}
-            )
+        Args:
+            event: Lambda event
             
-            # Update metrics
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='check_delete_status_failures',
-                value=1,
-                unit='Count'
-            )
+        Returns:
+            Tuple[str, str]: Target cluster ID and region
             
-            return {
-                'statusCode': 500,
-                'body': {
-                    'message': error_msg,
-                    'operation_id': operation_id,
-                    'success': False
-                }
-            }
+        Raises:
+            ValueError: If cluster details are missing
+        """
+        state = self.load_state()
         
-        # Check cluster status
-        try:
-            logger.info(f"Checking status of cluster {target_cluster_id} in {target_region}")
-            cluster = rds_client.describe_db_clusters(DBClusterIdentifier=target_cluster_id)['DBClusters'][0]
-            status = cluster['Status']
-            logger.info(f"Cluster {target_cluster_id} status: {status}")
-            
-            # Update state
-            state_update = {
-                'operation_id': operation_id,
-                'target_cluster_id': target_cluster_id,
-                'target_region': target_region,
-                'status': status,
-                'success': True
-            }
-            save_state(operation_id, state_update)
-            
-            # Log audit event
-            log_audit_event(
-                operation_id=operation_id,
-                event_type='check_delete_status',
-                status='success',
-                details={
-                    'cluster_id': target_cluster_id,
-                    'region': target_region,
-                    'status': status,
-                    'message': 'Cluster deletion in progress'
-                }
-            )
-            
-            # Update metrics
-            duration = time.time() - start_time
-            update_metrics(
-                operation_id=operation_id,
-                metric_name='check_delete_status_duration',
-                value=duration,
-                unit='Seconds'
-            )
-            
-            return {
-                'statusCode': 200,
-                'body': {
-                    'message': 'Cluster deletion in progress',
-                    'operation_id': operation_id,
-                    'cluster_id': target_cluster_id,
-                    'region': target_region,
-                    'status': status,
-                    'success': True
-                }
-            }
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'DBClusterNotFoundFault':
-                logger.info(f"Cluster {target_cluster_id} has been deleted")
-                status = 'deleted'
-                
-                # Update state
-                state_update = {
-                    'operation_id': operation_id,
-                    'target_cluster_id': target_cluster_id,
-                    'target_region': target_region,
-                    'status': status,
-                    'success': True
-                }
-                save_state(operation_id, state_update)
-                
-                # Log audit event
-                log_audit_event(
-                    operation_id=operation_id,
-                    event_type='check_delete_status',
-                    status='success',
-                    details={
-                        'cluster_id': target_cluster_id,
-                        'region': target_region,
-                        'status': status,
-                        'message': 'Cluster deletion complete'
-                    }
-                )
-                
-                # Update metrics
-                duration = time.time() - start_time
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='check_delete_status_duration',
-                    value=duration,
-                    unit='Seconds'
-                )
-                
-                return {
-                    'statusCode': 200,
-                    'body': {
-                        'message': 'Cluster deletion complete',
-                        'operation_id': operation_id,
-                        'cluster_id': target_cluster_id,
-                        'region': target_region,
-                        'success': True
-                    }
-                }
-            else:
-                error_details = handle_aws_error(e, operation_id, 'check_delete_status')
-                
-                # Update metrics
-                update_metrics(
-                    operation_id=operation_id,
-                    metric_name='check_delete_status_failures',
-                    value=1,
-                    unit='Count'
-                )
-                
-                return {
-                    'statusCode': error_details.get('statusCode', 500),
-                    'body': {
-                        'message': error_details.get('message', 'Failed to check cluster status'),
-                        'operation_id': operation_id,
-                        'error': error_details.get('error', str(e)),
-                        'success': False
-                    }
-                }
-        
-    except Exception as e:
-        error_msg = f"Error in check_delete_status: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        
-        # Log audit event for failure
-        log_audit_event(
-            operation_id=operation_id,
-            event_type='check_delete_status',
-            status='failed',
-            details={
-                'error': error_msg
-            }
+        target_cluster_id = (
+            state.get('target_cluster_id') or 
+            event.get('target_cluster_id') or 
+            self.config.get('target_cluster_id')
         )
         
-        # Update metrics
-        update_metrics(
-            operation_id=operation_id,
-            metric_name='check_delete_status_failures',
-            value=1,
-            unit='Count'
+        target_region = (
+            state.get('target_region') or 
+            event.get('target_region') or 
+            self.config.get('target_region')
+        )
+        
+        if not target_cluster_id:
+            raise ValueError("Target cluster ID is required")
+        
+        if not target_region:
+            raise ValueError("Target region is required")
+        
+        return target_cluster_id, target_region
+    
+    def initialize_rds_client(self, region: str) -> None:
+        """
+        Initialize RDS client for target region.
+        
+        Args:
+            region: AWS region
+            
+        Raises:
+            Exception: If client initialization fails
+        """
+        try:
+            self.rds_client = get_client('rds', region_name=region)
+        except Exception as e:
+            raise Exception(f"Failed to create RDS client for region {region}: {str(e)}")
+    
+    def check_cluster_status(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check the status of the cluster.
+        
+        Args:
+            cluster_id: ID of the cluster to check
+            
+        Returns:
+            Optional[Dict[str, Any]]: Cluster details if found, None if deleted
+            
+        Raises:
+            Exception: If check fails
+        """
+        try:
+            logger.info(f"Checking status of cluster {cluster_id}")
+            response = self.rds_client.describe_db_clusters(DBClusterIdentifier=cluster_id)
+            if response['DBClusters']:
+                cluster = response['DBClusters'][0]
+                status = cluster['Status']
+                logger.info(f"Cluster {cluster_id} status: {status}")
+                return cluster
+            return None
+        except Exception as e:
+            if 'DBClusterNotFoundFault' in str(e):
+                logger.info(f"Cluster {cluster_id} has been deleted")
+                return None
+            handle_aws_error(e, self.operation_id, self.step_name)
+            raise
+    
+    def handle_cluster_deleted(self, cluster_id: str, region: str) -> Dict[str, Any]:
+        """
+        Handle case where cluster has been deleted.
+        
+        Args:
+            cluster_id: ID of the cluster
+            region: AWS region
+            
+        Returns:
+            Dict[str, Any]: Response
+        """
+        # Update state
+        state = {
+            'target_cluster_id': cluster_id,
+            'target_region': region,
+            'status': 'deleted',
+            'success': True
+        }
+        
+        self.save_state(state)
+        
+        # Trigger next step - restore snapshot
+        trigger_next_step(
+            self.operation_id,
+            'restore_snapshot',
+            state
         )
         
         return {
-            'statusCode': 500,
-            'body': {
-                'message': 'Failed to check cluster deletion status',
-                'operation_id': operation_id,
-                'error': str(e),
-                'success': False
-            }
-        } 
+            'message': 'Cluster deletion complete',
+            'cluster_id': cluster_id,
+            'region': region,
+            'next_step': 'restore_snapshot'
+        }
+    
+    def handle_cluster_deleting(self, cluster_id: str, region: str, status: str) -> Dict[str, Any]:
+        """
+        Handle case where cluster is still being deleted.
+        
+        Args:
+            cluster_id: ID of the cluster
+            region: AWS region
+            status: Current status of the cluster
+            
+        Returns:
+            Dict[str, Any]: Response
+        """
+        # Update state
+        state = {
+            'target_cluster_id': cluster_id,
+            'target_region': region,
+            'status': status,
+            'success': True
+        }
+        
+        self.save_state(state)
+        
+        return {
+            'message': 'Cluster deletion in progress',
+            'cluster_id': cluster_id,
+            'region': region,
+            'status': status
+        }
+    
+    def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        """
+        Process the cluster deletion status check request.
+        
+        Args:
+            event: Lambda event
+            context: Lambda context
+            
+        Returns:
+            dict: Processing result
+        """
+        start_time = time.time()
+        
+        # Validate configuration
+        self.validate_config()
+        
+        # Get cluster details
+        target_cluster_id, target_region = self.get_cluster_details(event)
+        
+        # Initialize RDS client
+        self.initialize_rds_client(target_region)
+        
+        try:
+            # Check cluster status
+            cluster = self.check_cluster_status(target_cluster_id)
+            
+            if not cluster:
+                # Cluster has been deleted
+                result = self.handle_cluster_deleted(target_cluster_id, target_region)
+                
+                # Update metrics
+                duration = time.time() - start_time
+                self.update_metrics('check_delete_status_duration', duration, 'Seconds')
+                
+                return result
+            
+            # Cluster is still being deleted
+            status = cluster['Status']
+            result = self.handle_cluster_deleting(target_cluster_id, target_region, status)
+            
+            # Update metrics
+            duration = time.time() - start_time
+            self.update_metrics('check_delete_status_duration', duration, 'Seconds')
+            
+            return result
+            
+        except Exception as e:
+            # Update metrics for failure
+            duration = time.time() - start_time
+            self.update_metrics('check_delete_status_duration', duration, 'Seconds')
+            self.update_metrics('check_delete_status_failures', 1, 'Count')
+            
+            raise
+
+# Initialize handler
+handler = CheckDeleteStatusHandler()
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    Lambda handler for checking RDS cluster deletion status.
+    
+    Args:
+        event: Lambda event
+        context: Lambda context
+        
+    Returns:
+        dict: Response
+    """
+    return handler.execute(event, context) 

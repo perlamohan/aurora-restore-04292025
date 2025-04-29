@@ -1,0 +1,160 @@
+{
+  "title": "Aurora Restore Lambda Functions Sequence",
+  "description": "This document outlines the sequence and rules for the Aurora restore Lambda functions.",
+  "function_sequence": [
+    {
+      "name": "aurora-restore-snapshot-check",
+      "description": "Checks for the existence of daily snapshots in the source account"
+    },
+    {
+      "name": "aurora-restore-copy-snapshot",
+      "description": "Copies the snapshot to the target region"
+    },
+    {
+      "name": "aurora-restore-check-copy-status",
+      "description": "Checks the status of the snapshot copy operation"
+    },
+    {
+      "name": "aurora-restore-delete-rds",
+      "description": "Deletes the existing RDS cluster in the target region"
+    },
+    {
+      "name": "aurora-restore-check-delete-status",
+      "description": "Checks the status of the cluster deletion"
+    },
+    {
+      "name": "aurora-restore-restore-snapshot",
+      "description": "Restores the cluster from the snapshot"
+    },
+    {
+      "name": "aurora-restore-check-restore-status",
+      "description": "Checks the status of the restore operation"
+    },
+    {
+      "name": "aurora-restore-setup-db-users",
+      "description": "Sets up database users and permissions"
+    },
+    {
+      "name": "aurora-restore-archive-snapshot",
+      "description": "Archives the snapshot after successful restore"
+    },
+    {
+      "name": "aurora-restore-sns-notification",
+      "description": "Sends SNS notification about the restore process completion"
+    }
+  ],
+  "utility_modules": [
+    {
+      "name": "base_handler.py",
+      "description": "Base handler class providing common functionality for all Lambda functions"
+    },
+    {
+      "name": "common.py",
+      "description": "Common utilities for logging, metrics, and configuration"
+    },
+    {
+      "name": "state_utils.py",
+      "description": "Utilities for state management and transitions"
+    },
+    {
+      "name": "function_utils.py",
+      "description": "Function-specific utilities"
+    },
+    {
+      "name": "aws_utils.py",
+      "description": "AWS service interaction utilities"
+    },
+    {
+      "name": "validation.py",
+      "description": "Input validation utilities"
+    }
+  ],
+  "coding_standards": [
+    {
+      "name": "Class-based Structure",
+      "requirements": [
+        "Each Lambda function should have a handler class inheriting from `BaseHandler`",
+        "Organize code into logical methods with clear responsibilities",
+        "Improve code reusability and maintainability"
+      ]
+    },
+    {
+      "name": "Error Handling",
+      "requirements": [
+        "Centralize error handling through the base handler",
+        "Use consistent error reporting and logging",
+        "Implement proper exception handling with specific error types"
+      ]
+    },
+    {
+      "name": "State Management",
+      "requirements": [
+        "Use improved state handling with dedicated methods",
+        "Ensure clear state transitions and updates",
+        "Implement proper state validation and error checking"
+      ]
+    },
+    {
+      "name": "Code Organization",
+      "requirements": [
+        "Split functionality into smaller, focused methods",
+        "Add comprehensive docstrings and type hints",
+        "Improve code readability and maintainability"
+      ]
+    },
+    {
+      "name": "Metrics and Logging",
+      "requirements": [
+        "Use consistent metrics tracking",
+        "Implement improved logging with context",
+        "Ensure proper performance monitoring"
+      ]
+    },
+    {
+      "name": "AWS Integration",
+      "requirements": [
+        "Improve AWS client initialization",
+        "Implement better error handling for AWS operations",
+        "Ensure cleaner AWS service interactions"
+      ]
+    },
+    {
+      "name": "Documentation",
+      "requirements": [
+        "Add comprehensive docstrings",
+        "Provide clear method and class documentation",
+        "Include improved code comments"
+      ]
+    }
+  ],
+  "best_practices": [
+    {
+      "name": "Modularity",
+      "description": "Keep functions small and focused on a single responsibility"
+    },
+    {
+      "name": "Error Handling",
+      "description": "Implement proper error handling and recovery mechanisms"
+    },
+    {
+      "name": "Logging",
+      "description": "Use structured logging with appropriate context"
+    },
+    {
+      "name": "Metrics",
+      "description": "Track performance metrics and error rates"
+    },
+    {
+      "name": "State Management",
+      "description": "Maintain clear state transitions and validation"
+    },
+    {
+      "name": "Security",
+      "description": "Follow security best practices for AWS resource access"
+    },
+    {
+      "name": "Testing",
+      "description": "Implement unit tests for critical functionality"
+    }
+  ]
+} 

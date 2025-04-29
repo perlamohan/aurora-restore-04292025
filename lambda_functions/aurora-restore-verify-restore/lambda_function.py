@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lambda function to set up database users after a cluster restore.
+Lambda function to verify the restored cluster's functionality.
 """
 
 import json
@@ -13,12 +13,12 @@ from utils.validation import validate_required_params, validate_region, validate
 from utils.aws_utils import get_client, handle_aws_error, get_secret
 from utils.state_utils import trigger_next_step
 
-class SetupDbUsersHandler(BaseHandler):
-    """Handler for setting up database users."""
+class VerifyRestoreHandler(BaseHandler):
+    """Handler for verifying cluster restore."""
     
     def __init__(self):
-        """Initialize the setup DB users handler."""
-        super().__init__('setup_db_users')
+        """Initialize the verify restore handler."""
+        super().__init__('verify_restore')
         self.rds_client = None
         self.secrets_client = None
     
@@ -116,21 +116,21 @@ class SetupDbUsersHandler(BaseHandler):
             handle_aws_error(e, "Error getting master credentials")
             raise
     
-    def setup_users(self, endpoint: str, port: int, master_username: str, master_password: str) -> List[Dict[str, str]]:
+    def verify_connection(self, endpoint: str, port: int, username: str, password: str) -> bool:
         """
-        Set up database users.
+        Verify database connection.
         
         Args:
             endpoint: Cluster endpoint
             port: Cluster port
-            master_username: Master database username
-            master_password: Master database password
+            username: Database username
+            password: Database password
             
         Returns:
-            List[Dict[str, str]]: List of created users
+            bool: True if connection successful, False otherwise
             
         Raises:
-            Exception: If user setup fails
+            Exception: If verification fails
         """
         try:
             # Import psycopg2 here to avoid Lambda layer issues
@@ -141,48 +141,85 @@ class SetupDbUsersHandler(BaseHandler):
                 host=endpoint,
                 port=port,
                 database='postgres',
-                user=master_username,
-                password=master_password
+                user=username,
+                password=password
             )
             
             # Create a cursor
             cur = conn.cursor()
             
-            # Get list of users to create from config
-            users = this.config.get('db_users', [])
-            created_users = []
-            
-            for user in users:
-                username = user.get('username')
-                password = user.get('password')
-                privileges = user.get('privileges', [])
-                
-                if not username or not password:
-                    logger.warning(f"Skipping user setup: missing username or password")
-                    continue
-                
-                # Create user
-                cur.execute(f"CREATE USER {username} WITH PASSWORD '{password}'")
-                
-                # Grant privileges
-                for privilege in privileges:
-                    cur.execute(f"GRANT {privilege} TO {username}")
-                
-                created_users.append({
-                    'username': username,
-                    'privileges': privileges
-                })
-            
-            # Commit the transaction
-            conn.commit()
+            # Execute a simple query
+            cur.execute('SELECT version()')
+            version = cur.fetchone()[0]
             
             # Close the cursor and connection
             cur.close()
             conn.close()
             
-            return created_users
+            logger.info(f"Successfully connected to database. Version: {version}")
+            return True
         except Exception as e:
-            logger.error(f"Error setting up users: {str(e)}")
+            logger.error(f"Error verifying connection: {str(e)}")
+            return False
+    
+    def verify_schema(self, endpoint: str, port: int, username: str, password: str) -> Dict[str, Any]:
+        """
+        Verify database schema.
+        
+        Args:
+            endpoint: Cluster endpoint
+            port: Cluster port
+            username: Database username
+            password: Database password
+            
+        Returns:
+            Dict[str, Any]: Schema verification results
+            
+        Raises:
+            Exception: If verification fails
+        """
+        try:
+            # Import psycopg2 here to avoid Lambda layer issues
+            import psycopg2
+            
+            # Connect to the database
+            conn = psycopg2.connect(
+                host=endpoint,
+                port=port,
+                database='postgres',
+                user=username,
+                password=password
+            )
+            
+            # Create a cursor
+            cur = conn.cursor()
+            
+            # Get list of schemas
+            cur.execute("""
+                SELECT schema_name 
+                FROM information_schema.schemata 
+                WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
+            """)
+            schemas = [row[0] for row in cur.fetchall()]
+            
+            # Get list of tables
+            cur.execute("""
+                SELECT table_schema, table_name 
+                FROM information_schema.tables 
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+            """)
+            tables = [{'schema': row[0], 'name': row[1]} for row in cur.fetchall()]
+            
+            # Close the cursor and connection
+            cur.close()
+            conn.close()
+            
+            return {
+                'schemas': schemas,
+                'tables': tables
+            }
+        except Exception as e:
+            logger.error(f"Error verifying schema: {str(e)}")
             raise
     
     def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -215,15 +252,51 @@ class SetupDbUsersHandler(BaseHandler):
             # Get master credentials
             master_username, master_password = this.get_master_credentials()
             
-            # Set up users
-            created_users = this.setup_users(endpoint, port, master_username, master_password)
+            # Verify connection
+            connection_verified = this.verify_connection(endpoint, port, master_username, master_password)
+            
+            if not connection_verified:
+                error_message = f"Failed to verify connection to cluster {cluster_id}"
+                logger.error(error_message)
+                
+                # Save state with error
+                state_data = {
+                    'target_cluster_id': cluster_id,
+                    'cluster_endpoint': endpoint,
+                    'cluster_port': port,
+                    'verification_status': 'failed',
+                    'status': 'failed',
+                    'success': False,
+                    'error': error_message
+                }
+                
+                this.save_state(state_data)
+                
+                # Log audit with failure
+                this.log_audit(operation_id, 'FAILED', {
+                    'target_cluster_id': cluster_id,
+                    'error': error_message
+                })
+                
+                # Update metrics with failure
+                this.update_metrics(operation_id, 'verification_failure', 1)
+                
+                return this.create_response(operation_id, {
+                    'message': error_message,
+                    'target_cluster_id': cluster_id,
+                    'next_step': None
+                }, 500)
+            
+            # Verify schema
+            schema_info = this.verify_schema(endpoint, port, master_username, master_password)
             
             # Save state
             state_data = {
                 'target_cluster_id': cluster_id,
                 'cluster_endpoint': endpoint,
                 'cluster_port': port,
-                'users_created': created_users,
+                'verification_status': 'completed',
+                'schema_info': schema_info,
                 'status': 'completed',
                 'success': True
             }
@@ -233,22 +306,25 @@ class SetupDbUsersHandler(BaseHandler):
             # Log audit
             this.log_audit(operation_id, 'SUCCESS', {
                 'target_cluster_id': cluster_id,
-                'users_created': len(created_users)
+                'schema_count': len(schema_info['schemas']),
+                'table_count': len(schema_info['tables'])
             })
             
             # Update metrics
-            this.update_metrics(operation_id, 'users_created', len(created_users))
+            this.update_metrics(operation_id, 'verification_success', 1)
+            this.update_metrics(operation_id, 'schema_count', len(schema_info['schemas']))
+            this.update_metrics(operation_id, 'table_count', len(schema_info['tables']))
             
             # Trigger next step
-            trigger_next_step(operation_id, 'verify_restore', state_data)
+            trigger_next_step(operation_id, 'notify_completion', state_data)
             
             return this.create_response(operation_id, {
-                'message': f"Successfully set up {len(created_users)} users for cluster {cluster_id}",
+                'message': f"Successfully verified cluster {cluster_id}",
                 'target_cluster_id': cluster_id,
                 'cluster_endpoint': endpoint,
                 'cluster_port': port,
-                'users_created': created_users,
-                'next_step': 'verify_restore'
+                'schema_info': schema_info,
+                'next_step': 'notify_completion'
             })
         except Exception as e:
             return this.handle_error(operation_id, e, {
@@ -266,5 +342,5 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Lambda response
     """
-    handler = SetupDbUsersHandler()
+    handler = VerifyRestoreHandler()
     return handler.execute(event, context) 
